@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   # ==========================================
-  # 1. BUILD ANDROID (APK TWA)
+  # 1. BUILD ANDROID (APK TWA via Bubblewrap)
   # ==========================================
   build-android:
     name: Build Android APK
@@ -26,37 +26,44 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Pasang Komponen Wajib Android SDK
+      - name: Setup Clean Android SDK Khusus Bubblewrap
         run: |
-          # Tambahkan cmdline-tools ke PATH
-          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+          echo "Mendownload Android SDK murni..."
+          export CUSTOM_SDK="/home/runner/custom-android-sdk"
+          mkdir -p $CUSTOM_SDK/cmdline-tools
+          cd $CUSTOM_SDK/cmdline-tools
           
-          # Terima lisensi
-          yes | sdkmanager --licenses || true
+          # Download command-line tools resmi Android
+          wget https://dl.google.com/android/repository/commandlinetools-linux-10406996_latest.zip -O tools.zip
+          unzip -q tools.zip
+          mv cmdline-tools latest
+          rm tools.zip
           
-          # Bubblewrap WAJIB membutuhkan platform-tools dan build-tools ini ada di dalam folder SDK
-          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
-
-      - name: Install Bubblewrap CLI
-        run: npm install -g @bubblewrap/cli
-
-      - name: Konfigurasi Bubblewrap & Keystore
-        run: |
+          # Setujui lisensi dan install tools yang presisi sesuai standar Bubblewrap
+          yes | ./latest/bin/sdkmanager --licenses || true
+          ./latest/bin/sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          
+          # Arahkan konfigurasi Bubblewrap ke SDK buatan kita sendiri
           mkdir -p ~/.bubblewrap
           cat <<EOF > ~/.bubblewrap/config.json
           {
             "jdkPath": "${JAVA_HOME}",
-            "androidSdkPath": "${ANDROID_HOME}"
+            "androidSdkPath": "${CUSTOM_SDK}"
           }
           EOF
 
-          # Buat keystore otomatis untuk penandatanganan APK
+      - name: Install Bubblewrap CLI
+        run: npm install -g @bubblewrap/cli
+
+      - name: Setup Keystore & Injeksi Manifest
+        run: |
+          # Buat keystore dummy agar tidak ada pertanyaan interaktif
           keytool -genkey -v -keystore android.keystore \
             -alias android -keyalg RSA -keysize 2048 -validity 10000 \
             -storepass password123 -keypass password123 \
             -dname "CN=Gwadeving, OU=Cloud, O=Gwadeving, L=Solo, S=CentralJava, C=ID"
 
-          # Sisipkan info keystore ke twa-manifest.json agar Bubblewrap tidak bertanya lagi
+          # Injeksi paksa path keystore ke twa-manifest.json menggunakan Node.js
           node -e '
             const fs = require("fs");
             const manifest = JSON.parse(fs.readFileSync("twa-manifest.json", "utf8"));
@@ -69,10 +76,10 @@ jobs:
 
       - name: Build Android APK
         env:
-          KEYSTORE_PASSWORD: password123
-          KEY_PASSWORD: password123
+          KEYSTORE_PASSWORD: GwadevingAppPass
+          KEY_PASSWORD: GwadevingAppPass
         run: |
-          # Jalankan build murni tanpa prompt
+          # Build APK murni, tidak perlu piping `yes ""` yang bikin broken pipe
           bubblewrap build --skipPwaValidation --keyStorePassword=password123 --keyPassword=password123
 
       - name: Cari File APK Hasil Build
