@@ -3338,27 +3338,42 @@ function escapeHtml(s) { return String(s ?? '').replace(/[&<>'"]/g, c => ({'&':'
 function previewLoading(container, text='Memuat pratinjau...', percent=null) {
     container.innerHTML = `<div style="width:min(520px,90%);text-align:center;color:#fff;"><div class="spinner" style="margin:auto;border-color:rgba(255,255,255,.2);border-top-color:var(--accent);"></div><p style="margin-top:12px;">${escapeHtml(text)}</p>${percent!==null?`<div class="progress-track preview-progress" style="margin:14px auto 0;background:rgba(255,255,255,.15)"><div class="progress-fill" id="preview-progress-bar" style="width:${percent}%"></div></div><div id="preview-progress-text" style="margin-top:7px;font-size:12px;opacity:.8">${percent}%</div>`:''}</div>`;
 }
-async function convertImageToWebP(blob, maxBytes=5*1024*1024) {
+
+async function convertImageToWebP(blob) {
     if (!blob || !String(blob.type).startsWith('image/')) return blob;
-    if (blob.type === 'image/webp' && blob.size <= maxBytes) return blob;
-    const bitmap = await createImageBitmap(blob).catch(()=>null);
-    if (!bitmap) return blob;
-    let scale = Math.min(1, Math.sqrt(maxBytes / Math.max(blob.size,1)) * 1.25);
-    let w = Math.max(1, Math.round(bitmap.width * scale)), h = Math.max(1, Math.round(bitmap.height * scale));
-    for (let attempt=0; attempt<6; attempt++) {
-        const canvas=document.createElement('canvas'); canvas.width=w; canvas.height=h;
-        const ctx=canvas.getContext('2d'); ctx.drawImage(bitmap,0,0,w,h);
-        let quality=0.86;
-        for (let q=0;q<7;q++) {
-            const out=await new Promise(r=>canvas.toBlob(r,'image/webp',quality));
-            if (out && out.size<=maxBytes) { bitmap.close?.(); return out; }
-            quality-=0.08;
+    
+    try {
+        const bitmap = await createImageBitmap(blob);
+        let w = bitmap.width;
+        let h = bitmap.height;
+        
+        // Batasi ukuran maksimal ke 1080px (sangat aman & cepat untuk thumbnail Telegram)
+        const MAX_DIMENSION = 1080;
+        if (w > MAX_DIMENSION || h > MAX_DIMENSION) {
+            const ratio = Math.min(MAX_DIMENSION / w, MAX_DIMENSION / h);
+            w = Math.round(w * ratio);
+            h = Math.round(h * ratio);
         }
-        w=Math.max(320,Math.round(w*.72)); h=Math.max(320,Math.round(h*.72));
+        
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        
+        const ctx = canvas.getContext('2d');
+        // Gunakan kualitas smoothing medium agar render lebih ngebut
+        ctx.imageSmoothingQuality = 'medium'; 
+        ctx.drawImage(bitmap, 0, 0, w, h);
+        bitmap.close?.(); // Bebaskan memori segera
+        
+        // Konversi WebP cukup 1 kali eksekusi dengan kompresi 80% (sekitar 50KB - 200KB)
+        const outBlob = await new Promise(r => canvas.toBlob(r, 'image/webp', 0.8));
+        return outBlob || blob;
+    } catch (e) {
+        console.warn("Gagal konversi WebP, fallback ke file asli:", e);
+        return blob; // Jika gagal, langsung kembalikan file aslinya agar proses upload tidak putus
     }
-    bitmap.close?.();
-    return blob;
 }
+
 
 async function drawAudioWave(container, audioUrl) {
     container.innerHTML = `
