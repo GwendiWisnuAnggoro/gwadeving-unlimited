@@ -36,46 +36,44 @@ jobs:
       - name: Install Bubblewrap CLI
         run: npm install -g @bubblewrap/cli
 
-      - name: Configure Bubblewrap (Format Satu Baris)
+      - name: Configure Bubblewrap
         run: |
           mkdir -p ~/.bubblewrap
           echo "{\"jdkPath\":\"$JAVA_HOME\",\"androidSdkPath\":\"$ANDROID_HOME\"}" > ~/.bubblewrap/config.json
 
-      - name: Generate Keystore & Inject Manifest
+      - name: Generate Keystore
         run: |
-          # Buat keystore dengan password baru
+          # Bikin kunci, tidak perlu disuntikkan ke manifest lagi
           keytool -genkey -v -keystore android.keystore \
             -alias android -keyalg RSA -keysize 2048 -validity 10000 \
             -storepass GwadevingAppPass -keypass GwadevingAppPass \
             -dname "CN=Gwadeving, OU=Cloud, O=Gwadeving, L=Solo, S=CentralJava, C=ID"
 
-          # Sisipkan kunci otomatis ke dalam file twa-manifest.json
-          node -e "
-            const fs = require('fs');
-            const manifestPath = 'twa-manifest.json';
-            const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-            manifest.signingKey = {
-              path: '${GITHUB_WORKSPACE}/android.keystore',
-              alias: 'android'
-            };
-            fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
-          "
-
-      - name: Build Android APK
+      - name: Build Android APK (Unsigned)
         run: |
-          # HANYA kirimkan tepat satu kali jawaban "no" agar tidak terjebak infinite loop
-          echo "no" | bubblewrap build \
-            --skipPwaValidation \
-            --keyStorePath="${GITHUB_WORKSPACE}/android.keystore" \
-            --keyStorePassword="GwadevingAppPass" \
-            --keyPassword="GwadevingAppPass"
+          # yes "no" untuk nolak regenerate project. --skipSigning agar APK jadi mentahan.
+          yes "no" | bubblewrap build --skipPwaValidation --skipSigning
 
-      - name: Cari File APK Hasil Build
-        id: find_apk
+      - name: Sign APK Secara Manual (Anti-Prompt / Bulletproof)
         run: |
+          # 1. Cari APK mentah hasil build Bubblewrap
+          APK_PATH=$(find . -name "*.apk" | head -n 1)
+          echo "Ditemukan APK mentah: $APK_PATH"
+          
+          # 2. Rapikan struktur APK (Syarat wajib sebelum di-sign)
+          $ANDROID_HOME/build-tools/34.0.0/zipalign -f -v 4 "$APK_PATH" app-aligned.apk
+          
+          # 3. Tanda tangani menggunakan apksigner murni dari Android (Dijamin tidak akan minta prompt terminal)
+          $ANDROID_HOME/build-tools/34.0.0/apksigner sign \
+            --ks android.keystore \
+            --ks-pass pass:GwadevingAppPass \
+            --key-pass pass:GwadevingAppPass \
+            --out Gwadeving-Cloud-Release.apk \
+            app-aligned.apk
+            
+          # 4. Pindahkan ke folder output
           mkdir -p output-android
-          find . -maxdepth 3 -name "*.apk" -exec cp {} output-android/ \;
-          ls -la output-android/
+          cp Gwadeving-Cloud-Release.apk output-android/
 
       - name: Upload APK sebagai Artifact
         uses: actions/upload-artifact@v4
