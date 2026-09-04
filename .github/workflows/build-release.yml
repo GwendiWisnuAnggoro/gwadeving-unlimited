@@ -26,41 +26,54 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
+      - name: Pasang Komponen Wajib Android SDK
+        run: |
+          # Tambahkan cmdline-tools ke PATH
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+          
+          # Terima lisensi
+          yes | sdkmanager --licenses || true
+          
+          # Bubblewrap WAJIB membutuhkan platform-tools dan build-tools ini ada di dalam folder SDK
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
       - name: Install Bubblewrap CLI
         run: npm install -g @bubblewrap/cli
 
-      - name: Setup Keystore & Config Bubblewrap
+      - name: Konfigurasi Bubblewrap & Keystore
         run: |
           mkdir -p ~/.bubblewrap
-          
-          # Gunakan Android SDK bawaan runner secara presisi
-          SDK_DIR="/usr/local/lib/android/sdk"
-          echo "Using Android SDK at: $SDK_DIR"
-          
-          # Terima semua lisensi SDK runner
-          yes | $SDK_DIR/cmdline-tools/latest/bin/sdkmanager --licenses || true
-          $SDK_DIR/cmdline-tools/latest/bin/sdkmanager "build-tools;34.0.0" "platforms;android-34" || true
-
           cat <<EOF > ~/.bubblewrap/config.json
           {
             "jdkPath": "${JAVA_HOME}",
-            "androidSdkPath": "${SDK_DIR}"
+            "androidSdkPath": "${ANDROID_HOME}"
           }
           EOF
-          
-          # Buat keystore otomatis agar proses build tidak meminta password
+
+          # Buat keystore otomatis untuk penandatanganan APK
           keytool -genkey -v -keystore android.keystore \
             -alias android -keyalg RSA -keysize 2048 -validity 10000 \
             -storepass password123 -keypass password123 \
             -dname "CN=Gwadeving, OU=Cloud, O=Gwadeving, L=Solo, S=CentralJava, C=ID"
 
+          # Sisipkan info keystore ke twa-manifest.json agar Bubblewrap tidak bertanya lagi
+          node -e '
+            const fs = require("fs");
+            const manifest = JSON.parse(fs.readFileSync("twa-manifest.json", "utf8"));
+            manifest.signingKey = {
+              path: "./android.keystore",
+              alias: "android"
+            };
+            fs.writeFileSync("twa-manifest.json", JSON.stringify(manifest, null, 2));
+          '
+
       - name: Build Android APK
         env:
-          KEYSTORE_PASSWORD: GwadevingAppPass
-          KEY_PASSWORD: GwadevingAppPass
+          KEYSTORE_PASSWORD: password123
+          KEY_PASSWORD: password123
         run: |
-          # Build APK langsung menggunakan keystore
-          bubblewrap build --skipPwaValidation --keyStorePath=./android.keystore --keyStorePassword=password123 --keyPassword=password123
+          # Jalankan build murni tanpa prompt
+          bubblewrap build --skipPwaValidation --keyStorePassword=password123 --keyPassword=password123
 
       - name: Cari File APK Hasil Build
         id: find_apk
