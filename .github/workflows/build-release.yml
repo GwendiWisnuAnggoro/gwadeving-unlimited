@@ -43,7 +43,6 @@ jobs:
 
       - name: Generate Keystore
         run: |
-          # Bikin kunci, tidak perlu disuntikkan ke manifest lagi
           keytool -genkey -v -keystore android.keystore \
             -alias android -keyalg RSA -keysize 2048 -validity 10000 \
             -storepass GwadevingAppPass -keypass GwadevingAppPass \
@@ -51,19 +50,18 @@ jobs:
 
       - name: Build Android APK (Unsigned)
         run: |
-          # yes "no" untuk nolak regenerate project. --skipSigning agar APK jadi mentahan.
-          yes "no" | bubblewrap build --skipPwaValidation --skipSigning
+          # Jawab "Y" SATU KALI saja untuk menyuruh Bubblewrap membuat project Android-nya
+          echo "Y" | bubblewrap build --skipPwaValidation --skipSigning
 
-      - name: Sign APK Secara Manual (Anti-Prompt / Bulletproof)
+      - name: Sign APK Secara Manual (Bypass Prompt Sepenuhnya)
         run: |
-          # 1. Cari APK mentah hasil build Bubblewrap
           APK_PATH=$(find . -name "*.apk" | head -n 1)
           echo "Ditemukan APK mentah: $APK_PATH"
           
-          # 2. Rapikan struktur APK (Syarat wajib sebelum di-sign)
+          # Rapikan struktur APK
           $ANDROID_HOME/build-tools/34.0.0/zipalign -f -v 4 "$APK_PATH" app-aligned.apk
           
-          # 3. Tanda tangani menggunakan apksigner murni dari Android (Dijamin tidak akan minta prompt terminal)
+          # Tanda tangani murni pakai alat bawaan Android (Anti-prompt/Anti-hang)
           $ANDROID_HOME/build-tools/34.0.0/apksigner sign \
             --ks android.keystore \
             --ks-pass pass:GwadevingAppPass \
@@ -71,7 +69,6 @@ jobs:
             --out Gwadeving-Cloud-Release.apk \
             app-aligned.apk
             
-          # 4. Pindahkan ke folder output
           mkdir -p output-android
           cp Gwadeving-Cloud-Release.apk output-android/
 
