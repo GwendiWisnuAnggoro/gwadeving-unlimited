@@ -14,6 +14,7 @@
   "orientation": "default",
   "fingerprints": [],
   "enableNotifications": true,
+  "splashScreenFadeOutDuration": 300,
   "isChromeOSOnly": false,
   "webManifestUrl": "https://gwendiwisnuanggoro.github.io/gwadeving-unlimited/manifest.json",
   "fallbackType": "customtabs",
