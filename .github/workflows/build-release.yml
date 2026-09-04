@@ -26,14 +26,18 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Setup Android SDK Licenses
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android Build Tools
         run: |
+          sdkmanager "platforms;android-34" "build-tools;34.0.0"
           yes | sdkmanager --licenses || true
 
       - name: Install Bubblewrap CLI
         run: npm install -g @bubblewrap/cli
 
-      - name: Setup Bubblewrap Config (Zero Prompt)
+      - name: Configure Bubblewrap
         run: |
           mkdir -p ~/.bubblewrap
           cat <<EOF > ~/.bubblewrap/config.json
@@ -42,16 +46,17 @@ jobs:
             "androidSdkPath": "${ANDROID_HOME}"
           }
           EOF
-
-      - name: Init Bubblewrap Project
-        run: |
-          # Inisialisasi project Android dari twa-manifest.json tanpa prompt interaktif
-          yes "" | bubblewrap init --manifest=twa-manifest.json || true
+          bubblewrap doctor
 
       - name: Build Android APK
         run: |
-          # Jalankan build dengan auto-confirm
-          yes "" | bubblewrap build --skipPwaValidation || bubblewrap build --skipPwaValidation --skipSigning
+          # Buat dummy keystore jika belum ada agar build tidak meminta password/signing
+          if [ ! -f "android.keystore" ]; then
+            keytool -genkey -v -keystore android.keystore -alias android -keyalg RSA -keysize 2048 -validity 10000 -storepass password123 -keypass password123 -dname "CN=Gwadeving, OU=Cloud, O=Gwadeving, L=Solo, S=CentralJava, C=ID"
+          fi
+          
+          # Jalankan build dengan auto konfirmasi
+          echo "password123" | bubblewrap build --skipPwaValidation || bubblewrap build --skipPwaValidation
 
       - name: Cari File APK Hasil Build
         id: find_apk
