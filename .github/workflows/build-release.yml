@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   # ==========================================
-  # 1. BUILD ANDROID (APK TWA via Bubblewrap)
+  # 1. BUILD ANDROID (APK TWA)
   # ==========================================
   build-android:
     name: Build Android APK
@@ -26,28 +26,29 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android Build Tools
-        run: |
-          yes | sdkmanager --licenses || true
-          sdkmanager "platforms;android-34" "build-tools;34.0.0"
-
       - name: Install Bubblewrap CLI
         run: npm install -g @bubblewrap/cli
 
-      - name: Konfigurasi Bubblewrap & Keystore
+      - name: Setup Keystore & Config Bubblewrap
         run: |
           mkdir -p ~/.bubblewrap
+          
+          # Gunakan Android SDK bawaan runner secara presisi
+          SDK_DIR="/usr/local/lib/android/sdk"
+          echo "Using Android SDK at: $SDK_DIR"
+          
+          # Terima semua lisensi SDK runner
+          yes | $SDK_DIR/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          $SDK_DIR/cmdline-tools/latest/bin/sdkmanager "build-tools;34.0.0" "platforms;android-34" || true
+
           cat <<EOF > ~/.bubblewrap/config.json
           {
             "jdkPath": "${JAVA_HOME}",
-            "androidSdkPath": "${ANDROID_HOME}"
+            "androidSdkPath": "${SDK_DIR}"
           }
           EOF
-
-          # Buat keystore otomatis untuk penandatanganan APK di CI
+          
+          # Buat keystore otomatis agar proses build tidak meminta password
           keytool -genkey -v -keystore android.keystore \
             -alias android -keyalg RSA -keysize 2048 -validity 10000 \
             -storepass password123 -keypass password123 \
@@ -58,8 +59,8 @@ jobs:
           KEYSTORE_PASSWORD: GwadevingAppPass
           KEY_PASSWORD: GwadevingAppPass
         run: |
-          # Langsung build dari twa-manifest.json tanpa inisialisasi ulang
-          printf "password123\npassword123\n" | bubblewrap build --skipPwaValidation
+          # Build APK langsung menggunakan keystore
+          bubblewrap build --skipPwaValidation --keyStorePath=./android.keystore --keyStorePassword=password123 --keyPassword=password123
 
       - name: Cari File APK Hasil Build
         id: find_apk
