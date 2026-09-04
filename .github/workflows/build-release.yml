@@ -26,61 +26,54 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Setup Clean Android SDK Khusus Bubblewrap
+      - name: Setup Android SDK Resmi
+        uses: android-actions/setup-android@v3
+
+      - name: Ensure Build Tools Tersedia
         run: |
-          echo "Mendownload Android SDK murni..."
-          export CUSTOM_SDK="/home/runner/custom-android-sdk"
-          mkdir -p $CUSTOM_SDK/cmdline-tools
-          cd $CUSTOM_SDK/cmdline-tools
-          
-          # Download command-line tools resmi Android
-          wget https://dl.google.com/android/repository/commandlinetools-linux-10406996_latest.zip -O tools.zip
-          unzip -q tools.zip
-          mv cmdline-tools latest
-          rm tools.zip
-          
-          # Setujui lisensi dan install tools yang presisi sesuai standar Bubblewrap
-          yes | ./latest/bin/sdkmanager --licenses || true
-          ./latest/bin/sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
-          
-          # Arahkan konfigurasi Bubblewrap ke SDK buatan kita sendiri
-          mkdir -p ~/.bubblewrap
-          cat <<EOF > ~/.bubblewrap/config.json
-          {
-            "jdkPath": "${JAVA_HOME}",
-            "androidSdkPath": "${CUSTOM_SDK}"
-          }
-          EOF
+          # Memastikan paket yang diminta Bubblewrap benar-benar ada di SDK bawaan runner
+          sdkmanager "build-tools;34.0.0"
 
       - name: Install Bubblewrap CLI
         run: npm install -g @bubblewrap/cli
 
-      - name: Setup Keystore & Injeksi Manifest
+      - name: Configure Bubblewrap (Format Satu Baris)
         run: |
-          # Buat keystore dummy agar tidak ada pertanyaan interaktif
+          mkdir -p ~/.bubblewrap
+          # Format satu baris ini 100% mencegah error pemotongan path atau masalah format JSON
+          echo "{\"jdkPath\":\"$JAVA_HOME\",\"androidSdkPath\":\"$ANDROID_HOME\"}" > ~/.bubblewrap/config.json
+          
+          # Cek isi konfigurasinya untuk memastikan path terekam dengan benar di log
+          cat ~/.bubblewrap/config.json
+
+      - name: Generate Keystore & Inject Manifest
+        run: |
+          # Buat keystore dengan password baru: GwadevingAppPass
           keytool -genkey -v -keystore android.keystore \
             -alias android -keyalg RSA -keysize 2048 -validity 10000 \
-            -storepass password123 -keypass password123 \
+            -storepass GwadevingAppPass -keypass GwadevingAppPass \
             -dname "CN=Gwadeving, OU=Cloud, O=Gwadeving, L=Solo, S=CentralJava, C=ID"
 
-          # Injeksi paksa path keystore ke twa-manifest.json menggunakan Node.js
-          node -e '
-            const fs = require("fs");
-            const manifest = JSON.parse(fs.readFileSync("twa-manifest.json", "utf8"));
+          # Sisipkan kunci otomatis ke dalam file twa-manifest.json
+          node -e "
+            const fs = require('fs');
+            const manifestPath = 'twa-manifest.json';
+            const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
             manifest.signingKey = {
-              path: "./android.keystore",
-              alias: "android"
+              path: '${GITHUB_WORKSPACE}/android.keystore',
+              alias: 'android'
             };
-            fs.writeFileSync("twa-manifest.json", JSON.stringify(manifest, null, 2));
-          '
+            fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+          "
 
       - name: Build Android APK
-        env:
-          KEYSTORE_PASSWORD: GwadevingAppPass
-          KEY_PASSWORD: GwadevingAppPass
         run: |
-          # Build APK murni, tidak perlu piping `yes ""` yang bikin broken pipe
-          bubblewrap build --skipPwaValidation --keyStorePassword=password123 --keyPassword=password123
+          # Eksekusi murni. Tidak ada pipe 'yes' atau terminal prompt interaktif
+          bubblewrap build \
+            --skipPwaValidation \
+            --keyStorePath="${GITHUB_WORKSPACE}/android.keystore" \
+            --keyStorePassword="GwadevingAppPass" \
+            --keyPassword="GwadevingAppPass"
 
       - name: Cari File APK Hasil Build
         id: find_apk
