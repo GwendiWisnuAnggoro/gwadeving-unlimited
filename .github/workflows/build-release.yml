@@ -31,7 +31,6 @@ jobs:
 
       - name: Ensure Build Tools Tersedia
         run: |
-          # Memastikan paket yang diminta Bubblewrap benar-benar ada di SDK bawaan runner
           sdkmanager "build-tools;34.0.0"
 
       - name: Install Bubblewrap CLI
@@ -40,21 +39,16 @@ jobs:
       - name: Configure Bubblewrap (Format Satu Baris)
         run: |
           mkdir -p ~/.bubblewrap
-          # Format satu baris ini 100% mencegah error pemotongan path atau masalah format JSON
           echo "{\"jdkPath\":\"$JAVA_HOME\",\"androidSdkPath\":\"$ANDROID_HOME\"}" > ~/.bubblewrap/config.json
-          
-          # Cek isi konfigurasinya untuk memastikan path terekam dengan benar di log
           cat ~/.bubblewrap/config.json
 
       - name: Generate Keystore & Inject Manifest
         run: |
-          # Buat keystore dengan password baru: GwadevingAppPass
           keytool -genkey -v -keystore android.keystore \
             -alias android -keyalg RSA -keysize 2048 -validity 10000 \
             -storepass GwadevingAppPass -keypass GwadevingAppPass \
             -dname "CN=Gwadeving, OU=Cloud, O=Gwadeving, L=Solo, S=CentralJava, C=ID"
 
-          # Sisipkan kunci otomatis ke dalam file twa-manifest.json
           node -e "
             const fs = require('fs');
             const manifestPath = 'twa-manifest.json';
@@ -68,8 +62,8 @@ jobs:
 
       - name: Build Android APK
         run: |
-          # Eksekusi murni. Tidak ada pipe 'yes' atau terminal prompt interaktif
-          bubblewrap build \
+          # Gunakan 'yes "Y"' untuk otomatis menjawab "Yes" saat Bubblewrap meminta persetujuan untuk me-regenerate project
+          yes "Y" | bubblewrap build \
             --skipPwaValidation \
             --keyStorePath="${GITHUB_WORKSPACE}/android.keystore" \
             --keyStorePassword="GwadevingAppPass" \
