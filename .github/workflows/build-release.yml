@@ -1,0 +1,115 @@
+name: Build APK & EXE
+
+# Jalan otomatis tiap kamu bikin tag versi baru, contoh:
+#   git tag v1.0.0 && git push origin v1.0.0
+# atau bisa dipicu manual lewat tab "Actions" di GitHub -> Run workflow
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # wajib, supaya boleh bikin Release + upload file
+
+jobs:
+  # =========================================================
+  # 1) ANDROID APK (Trusted Web Activity via Bubblewrap)
+  # =========================================================
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Bubblewrap CLI
+        run: npm install -g @bubblewrap/cli
+
+      - name: Init Bubblewrap project (pakai twa-manifest.json yang sudah ada)
+        run: |
+          mkdir -p android-build
+          cp twa-manifest.json android-build/twa-manifest.json
+          cd android-build
+          bubblewrap init --manifest twa-manifest.json --skipPwaValidation || true
+
+      - name: Build APK
+        working-directory: android-build
+        run: bubblewrap build --skipPwaValidation
+
+      - name: Upload APK sebagai artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gwadeving-cloud-android
+          path: |
+            android-build/app-release-signed.apk
+            android-build/app-release-bundle.aab
+
+  # =========================================================
+  # 2) WINDOWS EXE (via Tauri)
+  #    Catatan: butuh folder src-tauri/ hasil "cargo tauri init"
+  #    (lihat README-BUILD.md untuk setup sekali di awal)
+  # =========================================================
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@v1
+        continue-on-error: true
+
+      - name: Install Rust (fallback resmi)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        shell: bash
+
+      - name: Build EXE via Tauri
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Gwadeving Cloud ${{ github.ref_name }}"
+          releaseDraft: true
+          prerelease: false
+
+  # =========================================================
+  # 3) iOS — SENGAJA TIDAK DIOTOMATISASI
+  #    Apple TIDAK mengizinkan install app tanpa sertifikat
+  #    Apple Developer Program (berbayar, $99/tahun). Tanpa itu,
+  #    file .ipa yang dihasilkan CI TIDAK BISA di-install manual
+  #    di iPhone asli (beda dengan APK/EXE). Baca README-BUILD.md
+  #    bagian iOS untuk langkah lengkapnya begitu akun sudah ada.
+  # =========================================================
+
+  # =========================================================
+  # Gabungkan semua hasil build jadi satu GitHub Release
+  # =========================================================
+  create-release:
+    needs: [build-android, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: gwadeving-cloud-android
+          path: dist
+
+      - name: Buat / update GitHub Release + upload APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: dist/*
+          draft: true
