@@ -20,38 +20,44 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
+      - name: Setup Android SDK Licenses
+        run: |
+          yes | sdkmanager --licenses || true
+
       - name: Install Bubblewrap CLI
         run: npm install -g @bubblewrap/cli
 
-      - name: Configure Bubblewrap (Non-Interactive)
+      - name: Setup Bubblewrap Config (Zero Prompt)
         run: |
           mkdir -p ~/.bubblewrap
-          # Atur JDK & Android SDK secara otomatis tanpa prompt interaktif
-          bubblewrap updateConfig --jdkPath="$JAVA_HOME" --androidSdkPath="$ANDROID_HOME"
-          bubblewrap doctor
+          cat <<EOF > ~/.bubblewrap/config.json
+          {
+            "jdkPath": "${JAVA_HOME}",
+            "androidSdkPath": "${ANDROID_HOME}"
+          }
+          EOF
+
+      - name: Init Bubblewrap Project
+        run: |
+          # Inisialisasi project Android dari twa-manifest.json tanpa prompt interaktif
+          yes "" | bubblewrap init --manifest=twa-manifest.json || true
 
       - name: Build Android APK
         run: |
-          # Build APK dengan mengabaikan validasi URL online dan penandatanganan jika keystore belum ada
-          bubblewrap build --skipPwaValidation --skipSigning
+          # Jalankan build dengan auto-confirm
+          yes "" | bubblewrap build --skipPwaValidation || bubblewrap build --skipPwaValidation --skipSigning
 
       - name: Cari File APK Hasil Build
         id: find_apk
         run: |
           mkdir -p output-android
-          # Salin file APK yang ditemukan ke folder output
-          find . -maxdepth 2 -name "*.apk" -exec cp {} output-android/ \;
+          find . -maxdepth 3 -name "*.apk" -exec cp {} output-android/ \;
           ls -la output-android/
 
       - name: Upload APK sebagai Artifact
@@ -79,7 +85,7 @@ jobs:
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build Tauri App (Jika sudah diinisialisasi)
+      - name: Build Tauri App (Jika ada)
         id: tauri_build
         shell: bash
         run: |
@@ -90,7 +96,7 @@ jobs:
             find src-tauri/target/release/bundle -name "*.exe" -o -name "*.msi" -exec cp {} output-windows/ \;
             echo "has_bundle=true" >> $GITHUB_OUTPUT
           else
-            echo "Folder src-tauri belum ditemukan. Lewati build EXE untuk rilis ini."
+            echo "Folder src-tauri belum ditemukan. Lewati build EXE."
             echo "has_bundle=false" >> $GITHUB_OUTPUT
           fi
 
