@@ -31,13 +31,13 @@ jobs:
 
       - name: Install Android Build Tools
         run: |
-          sdkmanager "platforms;android-34" "build-tools;34.0.0"
           yes | sdkmanager --licenses || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0"
 
       - name: Install Bubblewrap CLI
         run: npm install -g @bubblewrap/cli
 
-      - name: Configure Bubblewrap
+      - name: Konfigurasi Bubblewrap & Keystore
         run: |
           mkdir -p ~/.bubblewrap
           cat <<EOF > ~/.bubblewrap/config.json
@@ -46,17 +46,20 @@ jobs:
             "androidSdkPath": "${ANDROID_HOME}"
           }
           EOF
-          bubblewrap doctor
+
+          # Buat keystore otomatis untuk penandatanganan APK di CI
+          keytool -genkey -v -keystore android.keystore \
+            -alias android -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass password123 -keypass password123 \
+            -dname "CN=Gwadeving, OU=Cloud, O=Gwadeving, L=Solo, S=CentralJava, C=ID"
 
       - name: Build Android APK
+        env:
+          KEYSTORE_PASSWORD: GwadevingAppPass
+          KEY_PASSWORD: GwadevingAppPass
         run: |
-          # Buat dummy keystore jika belum ada agar build tidak meminta password/signing
-          if [ ! -f "android.keystore" ]; then
-            keytool -genkey -v -keystore android.keystore -alias android -keyalg RSA -keysize 2048 -validity 10000 -storepass password123 -keypass password123 -dname "CN=Gwadeving, OU=Cloud, O=Gwadeving, L=Solo, S=CentralJava, C=ID"
-          fi
-          
-          # Jalankan build dengan auto konfirmasi
-          echo "password123" | bubblewrap build --skipPwaValidation || bubblewrap build --skipPwaValidation
+          # Langsung build dari twa-manifest.json tanpa inisialisasi ulang
+          printf "password123\npassword123\n" | bubblewrap build --skipPwaValidation
 
       - name: Cari File APK Hasil Build
         id: find_apk
@@ -70,7 +73,7 @@ jobs:
         with:
           name: Gwadeving-Cloud-Android
           path: output-android/*.apk
-          if-no-files-found: warn
+          if-no-files-found: error
 
   # ==========================================
   # 2. BUILD WINDOWS (EXE via Tauri)
