@@ -1141,6 +1141,9 @@ function renderUI() {
                 else crumbHTML += ` / <span onclick="navigateToFolder('${builtPath}')">${seg}</span>`;
             });
             breadcrumbEl.innerHTML = crumbHTML;
+            // Scroll ke ujung kanan supaya folder yang lagi dibuka (paling
+            // relevan) yang kelihatan, bukan "Beranda" di ujung kiri.
+            requestAnimationFrame(() => { breadcrumbEl.scrollLeft = breadcrumbEl.scrollWidth; });
         }
         document.getElementById('files-section-title').innerText = 'Berkas';
         renderFoldersAndFiles(q);
@@ -1814,32 +1817,59 @@ async function extractRawEmbeddedPreview(blobOrFile, timeoutMs = 15000) {
         new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout ekstraksi preview RAW')), timeoutMs))
     ]);
 
-    // Strategi 1: cara cepat resmi dari exifr, tapi paksa baca seluruh file
-    try {
-        const thumb = await withTimeout(exifr.thumbnail(blobOrFile, { chunked: false }));
-        if (thumb && thumb.byteLength > 0) return thumb;
-    } catch (e) { /* lanjut ke strategi manual di bawah */ }
+    // PATCH: sebelumnya cuma ambil thumbnail kecil dari IFD1 (biasanya
+    // cuma ~160x120px, memang didesain buat file browser cepat, BUKAN
+    // buat ditampilkan besar). Padahal kebanyakan file RAW kamera juga
+    // menyimpan preview kedua yang jauh lebih besar (mid/full-res) di
+    // lokasi IFD lain. Sekarang kita kumpulkan SEMUA kandidat gambar
+    // yang ketemu, lalu pakai yang PALING BESAR ukuran byte-nya.
+    const candidates = [];
+    let buf = null;
+    try { buf = await blobOrFile.arrayBuffer(); } catch (e) { return null; }
 
-    // Strategi 2: parse manual IFD0+IFD1 lalu potong sendiri dari buffer
-    // file. Ini menutupi kasus di mana exifr.thumbnail() gagal menebak
-    // lokasi data meski file-nya sudah dibaca penuh.
+    const addCandidate = (data) => { if (data && data.byteLength > 0) candidates.push(data); };
+
+    // Kandidat 1: cara resmi exifr (biasanya berhasil dapat thumbnail IFD1)
     try {
-        const output = await withTimeout(exifr.parse(blobOrFile, {
+        const thumb = await withTimeout(exifr.thumbnail(buf, { chunked: false }));
+        addCandidate(thumb);
+    } catch (e) { /* lanjut */ }
+
+    // Kandidat 2 & 3: baca manual tag offset/length di IFD0 DAN IFD1.
+    // IFD0 kerap menyimpan preview yang lebih besar (mid/full-res),
+    // sedangkan IFD1 biasanya cuma thumbnail kecil. Dua-duanya dicoba,
+    // nanti yang paling besar yang dipakai.
+    try {
+        const output = await withTimeout(exifr.parse(buf, {
             tiff: true, ifd0: true, ifd1: true, mergeOutput: false,
             translateKeys: true, reviveValues: false, chunked: false
         }));
-        const ifd1 = output && output.ifd1;
-        const offset = ifd1 && (ifd1.ThumbnailOffset ?? ifd1.JpegIFOffset);
-        const length = ifd1 && (ifd1.ThumbnailLength ?? ifd1.JpegIFByteCount);
-        if (typeof offset === 'number' && typeof length === 'number' && length > 0) {
-            const buf = await blobOrFile.arrayBuffer();
-            if (offset + length <= buf.byteLength) {
-                return buf.slice(offset, offset + length);
-            }
-        }
-    } catch (e) { /* memang tidak ada preview ter-embed di file ini */ }
+        [output && output.ifd0, output && output.ifd1].forEach(ifd => {
+            if (!ifd) return;
+            // Pasangan tag lama gaya EXIF (dipakai untuk thumbnail IFD1
+            // maupun preview yang ditaruh langsung di IFD0 oleh sebagian kamera)
+            const pairs = [
+                [ifd.ThumbnailOffset, ifd.ThumbnailLength],
+                [ifd.JpegIFOffset, ifd.JpegIFByteCount],
+                // Beberapa RAW menaruh preview JPEG-nya sebagai "strip"
+                // biasa (Compression = 6 artinya JPEG) alih-alih tag thumbnail.
+                [ifd.Compression === 6 ? ifd.StripOffsets : undefined,
+                 ifd.Compression === 6 ? ifd.StripByteCounts : undefined],
+            ];
+            pairs.forEach(([offset, length]) => {
+                offset = Array.isArray(offset) ? offset[0] : offset;
+                length = Array.isArray(length) ? length.reduce((a,b)=>a+b,0) : length;
+                if (typeof offset === 'number' && typeof length === 'number' && length > 0 && offset + length <= buf.byteLength) {
+                    addCandidate(buf.slice(offset, offset + length));
+                }
+            });
+        });
+    } catch (e) { /* memang tidak ada tag preview tambahan di file ini */ }
 
-    return null; // File ini benar-benar tidak menyertakan preview JPEG.
+    if (candidates.length === 0) return null; // File ini benar-benar tidak menyertakan preview JPEG.
+    // Pilih kandidat dengan ukuran byte terbesar -> biasanya itu yang
+    // resolusinya paling tinggi / paling layak ditampilkan penuh.
+    return candidates.reduce((best, c) => (c.byteLength > best.byteLength ? c : best));
 }
 
 async function parseAndShowExif(urlOrBlob, container) {
@@ -2091,7 +2121,20 @@ function processPermanentDeleteBulk() {
 }
 
 async function loadCardThumbnail(file, ext, containerId) {
-    if (fileUrlCache['thumb_' + file.id]) return applyThumbToContainer(fileUrlCache['thumb_' + file.id], ext, containerId);
+    if (fileUrlCache['thumb_' + file.id]) {
+        // PATCH: card yang manggil fungsi ini BELUM tentu sudah nempel di
+        // DOM saat baris ini jalan (proses build card & insert ke DOM
+        // dilakukan terpisah). Kalau cache sudah ada, sebelumnya kode ini
+        // langsung cari elemennya SAAT ITU JUGA (masih sinkron) — jadi
+        // sering gagal nemu container-nya dan diam-diam nyerah, makanya
+        // thumbnail muncul pas pertama kali (network fetch kasih jeda
+        // waktu cukup buat DOM ke-insert dulu) tapi hilang begitu masuk
+        // folder lain lalu balik lagi (langsung kena jalur cache yang
+        // dieksekusi sebelum card sempat ke-insert). Kasih jeda 1 tick
+        // dulu supaya proses insert-ke-DOM yang lagi berjalan selesai.
+        await Promise.resolve();
+        return applyThumbToContainer(fileUrlCache['thumb_' + file.id], ext, containerId);
+    }
     try {
         let fetchId = file.thumbId || null;
         if (!fetchId && !['mp4', 'webm', 'mov', 'mkv'].includes(ext)) {
@@ -3638,6 +3681,7 @@ async function renderPreviewContent(url, ext, container, blob) {
     try {
         if (IMAGE_EXTENSIONS.has(ext)) {
             let displayUrl = url;
+            let isRawExtractedPreview = false;
             // Browser TIDAK bisa render file RAW kamera (cr2/nef/arw/dst) secara
             // native sebagai <img>. Solusinya: ambil preview JPEG yang sudah
             // ter-embed di dalam file RAW-nya pakai exifr, lalu itu yang ditampilkan.
@@ -3651,10 +3695,21 @@ async function renderPreviewContent(url, ext, container, blob) {
                     if (thumbData) {
                         const rawThumbBlob = new Blob([thumbData], { type: 'image/jpeg' });
                         displayUrl = trackPreviewUrl(URL.createObjectURL(rawThumbBlob));
+                        isRawExtractedPreview = true;
                     }
                 } catch (e) { /* kalau gagal ekstrak, tetap coba tampilkan url asli di bawah */ }
             }
-            container.innerHTML=`<div style="display:flex;align-items:center;justify-content:center;width:100%;height:100%;"><img class="preview-media" src="${displayUrl}" alt="Preview" style="max-width:100%; max-height:85vh; object-fit:contain; border-radius:10px;" onerror="this.closest('div').innerHTML='<div style=&quot;color:#fff;text-align:center;max-width:420px;&quot;><span class=&quot;material-symbols-rounded&quot; style=&quot;font-size:48px;&quot;>broken_image</span><p style=&quot;margin-top:10px;font-size:13px;&quot;>File RAW ini tidak menyertakan preview JPEG bawaan, browser tidak bisa menampilkannya langsung. Silakan download filenya.</p></div>'"></div>`; 
+            // PATCH: preview yang diekstrak dari RAW sebelumnya cuma dikasih
+            // max-width/max-height, jadi kalau resolusi hasil ekstraksinya
+            // rendah (mis. yang ketemu cuma thumbnail kecil, bukan preview
+            // besar), gambar tampil kecil ngambang di tengah. Sekarang
+            // khusus untuk preview hasil ekstraksi RAW, dipaksa mengisi
+            // lebar penuh (width:100%) dengan tinggi menyesuaikan proporsi,
+            // supaya tetap terlihat "full" walau resolusi aslinya rendah.
+            const imgStyle = isRawExtractedPreview
+                ? 'width:100%; max-height:85vh; object-fit:contain; border-radius:10px;'
+                : 'max-width:100%; max-height:85vh; object-fit:contain; border-radius:10px;';
+            container.innerHTML=`<div style="display:flex;align-items:center;justify-content:center;width:100%;height:100%;"><img class="preview-media" src="${displayUrl}" alt="Preview" style="${imgStyle}" onerror="this.closest('div').innerHTML='<div style=&quot;color:#fff;text-align:center;max-width:420px;&quot;><span class=&quot;material-symbols-rounded&quot; style=&quot;font-size:48px;&quot;>broken_image</span><p style=&quot;margin-top:10px;font-size:13px;&quot;>File RAW ini tidak menyertakan preview JPEG bawaan, browser tidak bisa menampilkannya langsung. Silakan download filenya.</p></div>'"></div>`; 
             return;
         }
         if (VIDEO_EXTENSIONS.has(ext)) {
