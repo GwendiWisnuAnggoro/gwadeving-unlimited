@@ -132,8 +132,14 @@ main { flex: 1; background: linear-gradient(180deg, rgba(209, 250, 229, 0.4) 0%,
 
 .section-header { display: flex; justify-content: space-between; align-items: center; }
 .section-header h2 { font-size: 24px; font-weight: 800; color: #0f172a; letter-spacing: -0.02em; }
-.breadcrumb { display: flex; align-items: center; gap: 6px; font-size: 13.5px; color: var(--text-muted); margin-bottom: 4px; font-weight: 500; flex-wrap: wrap; row-gap: 4px; }
-.breadcrumb span { cursor: pointer; color: var(--primary); font-weight: 600; }
+/* PATCH: dulu breadcrumb pakai flex-wrap:wrap, jadi tiap masuk folder
+   lebih dalam nambah baris baru terus tinggi bar-nya makin membesar
+   sampai penuh layar. Sekarang dibikin satu baris yang bisa discroll
+   ke samping (kayak breadcrumb di Files app iOS/Android), dan otomatis
+   discroll ke folder paling akhir (yang lagi dibuka). */
+.breadcrumb { display: flex; align-items: center; gap: 6px; font-size: 13.5px; color: var(--text-muted); margin-bottom: 4px; font-weight: 500; flex-wrap: nowrap; overflow-x: auto; white-space: nowrap; scrollbar-width: none; -ms-overflow-style: none; }
+.breadcrumb::-webkit-scrollbar { display: none; }
+.breadcrumb span { cursor: pointer; color: var(--primary); font-weight: 600; flex-shrink: 0; }
 .breadcrumb span:hover { text-decoration: underline; }
 
 .search-bar { display: flex; align-items: center; background: rgba(255, 255, 255, 0.9); backdrop-filter: blur(4px); border: 1px solid var(--border-color); border-radius: var(--radius-md); padding: 14px 18px; width: 100%; transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1); box-shadow: 0 2px 8px -2px rgba(0, 0, 0, 0.04); flex-shrink: 0; }
@@ -338,8 +344,9 @@ main { flex: 1; background: linear-gradient(180deg, rgba(209, 250, 229, 0.4) 0%,
 .shared-header { background:#fff; border-bottom:1px solid var(--border-color); padding: 16px 24px; display:flex; align-items:center; justify-content:space-between; gap: 12px; }
 .shared-header .brand { font-size:16px; }
 .shared-owner-banner { background: var(--primary-light); color: var(--primary); font-size:13px; font-weight:600; padding:12px 24px; display:flex; align-items:center; gap:8px; }
-.shared-breadcrumb { background:#fff; border-bottom:1px solid var(--border-color); padding: 12px 24px; font-size: 12.5px; font-weight:600; color: var(--text-muted); display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
-.shared-breadcrumb span.crumb-link { color: var(--primary); cursor:pointer; }
+.shared-breadcrumb { background:#fff; border-bottom:1px solid var(--border-color); padding: 12px 24px; font-size: 12.5px; font-weight:600; color: var(--text-muted); display:flex; align-items:center; gap:6px; flex-wrap:nowrap; overflow-x:auto; white-space:nowrap; scrollbar-width:none; -ms-overflow-style:none; }
+.shared-breadcrumb::-webkit-scrollbar { display:none; }
+.shared-breadcrumb span.crumb-link { color: var(--primary); cursor:pointer; flex-shrink:0; }
 .shared-breadcrumb span.crumb-link:hover { text-decoration:underline; }
 .shared-body { padding: 24px; flex:1; max-width: 1100px; margin: 0 auto; width: 100%; }
 .shared-404 { display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; text-align:center; padding: 40px 20px; gap: 8px; }
