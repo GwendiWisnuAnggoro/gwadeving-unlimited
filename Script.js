@@ -1787,11 +1787,69 @@ function ensureExifrLoaded(timeoutMs = 6000) {
     return _exifrLoadPromise;
 }
 
+// ==========================================
+// PATCH: EKSTRAKSI THUMBNAIL/PREVIEW RAW YANG BENAR-BENAR ANDAL
+// Sebelumnya cuma dipanggil `exifr.thumbnail(blob)` polos. Masalahnya,
+// exifr punya optimisasi "chunked reading": dia MENEBAK berapa byte yang
+// perlu dibaca dari file, bukan langsung baca seluruh file. Untuk file
+// RAW kamera (CR2/NEF/ARW/dll), preview JPEG yang ter-embed sering
+// terletak jauh dari awal file — offset-nya melebihi tebakan chunk
+// default exifr — jadi hasilnya diam-diam KOSONG (bukan error), padahal
+// filenya sendiri sebenarnya punya preview.
+//
+// Perbaikan di sini:
+//  1) Paksa `chunked:false` supaya exifr baca SELURUH file (aman untuk
+//     file lokal/blob, beda dengan baca dari URL remote yang mahal).
+//  2) Kalau exifr.thumbnail() tetap kosong, fallback manual: parse IFD0
+//     + IFD1 untuk dapat ThumbnailOffset/ThumbnailLength, lalu potong
+//     langsung dari ArrayBuffer file itu sendiri.
+//  3) Timeout dinaikkan jadi 15 detik HANYA sebagai jaring pengaman
+//     untuk file yang benar-benar besar/rusak, bukan mekanisme utama.
+// ==========================================
+async function extractRawEmbeddedPreview(blobOrFile, timeoutMs = 15000) {
+    if (!(await ensureExifrLoaded())) return null;
+
+    const withTimeout = (promise) => Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout ekstraksi preview RAW')), timeoutMs))
+    ]);
+
+    // Strategi 1: cara cepat resmi dari exifr, tapi paksa baca seluruh file
+    try {
+        const thumb = await withTimeout(exifr.thumbnail(blobOrFile, { chunked: false }));
+        if (thumb && thumb.byteLength > 0) return thumb;
+    } catch (e) { /* lanjut ke strategi manual di bawah */ }
+
+    // Strategi 2: parse manual IFD0+IFD1 lalu potong sendiri dari buffer
+    // file. Ini menutupi kasus di mana exifr.thumbnail() gagal menebak
+    // lokasi data meski file-nya sudah dibaca penuh.
+    try {
+        const output = await withTimeout(exifr.parse(blobOrFile, {
+            tiff: true, ifd0: true, ifd1: true, mergeOutput: false,
+            translateKeys: true, reviveValues: false, chunked: false
+        }));
+        const ifd1 = output && output.ifd1;
+        const offset = ifd1 && (ifd1.ThumbnailOffset ?? ifd1.JpegIFOffset);
+        const length = ifd1 && (ifd1.ThumbnailLength ?? ifd1.JpegIFByteCount);
+        if (typeof offset === 'number' && typeof length === 'number' && length > 0) {
+            const buf = await blobOrFile.arrayBuffer();
+            if (offset + length <= buf.byteLength) {
+                return buf.slice(offset, offset + length);
+            }
+        }
+    } catch (e) { /* memang tidak ada preview ter-embed di file ini */ }
+
+    return null; // File ini benar-benar tidak menyertakan preview JPEG.
+}
+
 async function parseAndShowExif(urlOrBlob, container) {
     const exifrReady = await ensureExifrLoaded();
     if (!exifrReady || !window.exifr) { container.innerHTML = `<div style="margin-top:12px; font-size:12px; color:var(--text-muted);">Library EXIFR gagal dimuat (cek koneksi internet), coba buka lagi.</div>`; return; }
     try {
-        const output = await exifr.parse(urlOrBlob, { tiff: true, exif: true, gps: true, xmp: true, iptc: true });
+        // chunked:false: paksa baca seluruh file. Untuk RAW (CR2/NEF/dll) tag-tag
+        // EXIF kadang berada di luar jangkauan tebakan chunk default exifr,
+        // yang sebelumnya bisa bikin metadata tampak "tidak ada" padahal ada.
+        const output = await exifr.parse(urlOrBlob, { tiff: true, exif: true, gps: true, xmp: true, iptc: true, chunked: false });
         if (output && (output.Make || output.Model || output.ISO || output.ExposureTime || output.FNumber || output.FocalLength || (output.latitude && output.longitude))) {
             let html = `<div style="margin-top:16px; padding-top:16px; border-top:1px solid var(--border-color); font-size:13.5px;"><strong style="color:var(--text-primary); display:block; margin-bottom:10px;">Metadata Fotografi:</strong>`;
             if (output.Make || output.Model) {
@@ -2322,10 +2380,10 @@ async function startMultiUpload() {
             try {
                 let processBlob = fileInput;
                 if (['cr2','nef','arw','dng','raw','rw2','orf','pef','srw'].includes(format)) {
-                    if (await ensureExifrLoaded()) {
-                        let u8 = await exifr.thumbnail(fileInput);
-                        if (u8) processBlob = u8;
-                    }
+                    // Pakai helper ekstraksi yang andal (baca file penuh + fallback
+                    // manual offset), bukan cuma exifr.thumbnail() polos.
+                    const u8 = await extractRawEmbeddedPreview(fileInput);
+                    if (u8) processBlob = new Blob([u8], { type: 'image/jpeg' });
                 }
                 previewBlob = await Promise.race([
                     convertImageToWebP(processBlob, 5 * 1024 * 1024),
@@ -3338,42 +3396,27 @@ function escapeHtml(s) { return String(s ?? '').replace(/[&<>'"]/g, c => ({'&':'
 function previewLoading(container, text='Memuat pratinjau...', percent=null) {
     container.innerHTML = `<div style="width:min(520px,90%);text-align:center;color:#fff;"><div class="spinner" style="margin:auto;border-color:rgba(255,255,255,.2);border-top-color:var(--accent);"></div><p style="margin-top:12px;">${escapeHtml(text)}</p>${percent!==null?`<div class="progress-track preview-progress" style="margin:14px auto 0;background:rgba(255,255,255,.15)"><div class="progress-fill" id="preview-progress-bar" style="width:${percent}%"></div></div><div id="preview-progress-text" style="margin-top:7px;font-size:12px;opacity:.8">${percent}%</div>`:''}</div>`;
 }
-
-async function convertImageToWebP(blob) {
+async function convertImageToWebP(blob, maxBytes=5*1024*1024) {
     if (!blob || !String(blob.type).startsWith('image/')) return blob;
-    
-    try {
-        const bitmap = await createImageBitmap(blob);
-        let w = bitmap.width;
-        let h = bitmap.height;
-        
-        // Batasi ukuran maksimal ke 1080px (sangat aman & cepat untuk thumbnail Telegram)
-        const MAX_DIMENSION = 1080;
-        if (w > MAX_DIMENSION || h > MAX_DIMENSION) {
-            const ratio = Math.min(MAX_DIMENSION / w, MAX_DIMENSION / h);
-            w = Math.round(w * ratio);
-            h = Math.round(h * ratio);
+    if (blob.type === 'image/webp' && blob.size <= maxBytes) return blob;
+    const bitmap = await createImageBitmap(blob).catch(()=>null);
+    if (!bitmap) return blob;
+    let scale = Math.min(1, Math.sqrt(maxBytes / Math.max(blob.size,1)) * 1.25);
+    let w = Math.max(1, Math.round(bitmap.width * scale)), h = Math.max(1, Math.round(bitmap.height * scale));
+    for (let attempt=0; attempt<6; attempt++) {
+        const canvas=document.createElement('canvas'); canvas.width=w; canvas.height=h;
+        const ctx=canvas.getContext('2d'); ctx.drawImage(bitmap,0,0,w,h);
+        let quality=0.86;
+        for (let q=0;q<7;q++) {
+            const out=await new Promise(r=>canvas.toBlob(r,'image/webp',quality));
+            if (out && out.size<=maxBytes) { bitmap.close?.(); return out; }
+            quality-=0.08;
         }
-        
-        const canvas = document.createElement('canvas');
-        canvas.width = w;
-        canvas.height = h;
-        
-        const ctx = canvas.getContext('2d');
-        // Gunakan kualitas smoothing medium agar render lebih ngebut
-        ctx.imageSmoothingQuality = 'medium'; 
-        ctx.drawImage(bitmap, 0, 0, w, h);
-        bitmap.close?.(); // Bebaskan memori segera
-        
-        // Konversi WebP cukup 1 kali eksekusi dengan kompresi 80% (sekitar 50KB - 200KB)
-        const outBlob = await new Promise(r => canvas.toBlob(r, 'image/webp', 0.8));
-        return outBlob || blob;
-    } catch (e) {
-        console.warn("Gagal konversi WebP, fallback ke file asli:", e);
-        return blob; // Jika gagal, langsung kembalikan file aslinya agar proses upload tidak putus
+        w=Math.max(320,Math.round(w*.72)); h=Math.max(320,Math.round(h*.72));
     }
+    bitmap.close?.();
+    return blob;
 }
-
 
 async function drawAudioWave(container, audioUrl) {
     container.innerHTML = `
@@ -3604,12 +3647,10 @@ async function renderPreviewContent(url, ext, container, blob) {
             // kalau blob yang dikirim memang masih file RAW mentah aslinya.
             if (['cr2','nef','arw','dng','raw','rw2','orf','pef','srw'].includes(ext) && blob && blob.type !== 'image/webp') {
                 try {
-                    if (await ensureExifrLoaded()) {
-                        const thumbData = await exifr.thumbnail(blob);
-                        if (thumbData) {
-                            const rawThumbBlob = new Blob([thumbData], { type: 'image/jpeg' });
-                            displayUrl = trackPreviewUrl(URL.createObjectURL(rawThumbBlob));
-                        }
+                    const thumbData = await extractRawEmbeddedPreview(blob);
+                    if (thumbData) {
+                        const rawThumbBlob = new Blob([thumbData], { type: 'image/jpeg' });
+                        displayUrl = trackPreviewUrl(URL.createObjectURL(rawThumbBlob));
                     }
                 } catch (e) { /* kalau gagal ekstrak, tetap coba tampilkan url asli di bawah */ }
             }
