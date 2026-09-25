@@ -346,6 +346,9 @@ async function registerAccount() {
     const p = document.getElementById('reg-password').value.trim();
     const btn = document.getElementById('btn-register');
     if (!u || !p) return showToast("Semua kolom wajib diisi.", true);
+    // FIX #5: validasi format di client (server tetap validasi ulang -- ini cuma
+    // supaya user langsung dapat feedback tanpa perlu roundtrip ke server dulu).
+    if (!/^[A-Za-z0-9_.\-]{3,24}$/.test(u)) return showToast("Username hanya boleh huruf, angka, titik, garis bawah, atau strip (3-24 karakter).", true);
 
     const originalText = btn.innerHTML;
     btn.disabled = true;
@@ -616,13 +619,19 @@ function callGasAPIOnce_(gasUrl, action, payload) {
 // "Username sudah terdaftar!"), supaya pesan error yang relevan tetap
 // sampai ke user apa adanya, bukan malah disembunyikan oleh percobaan ulang.
 async function callGasAPI(action, payload = {}) {
+    // FIX #4: sebelum benar-benar dianggap error, ulangi seluruh siklus endpoint
+    // sampai 3x total (dengan jeda singkat) -- baru kalau SEMUA percobaan gagal
+    // karena masalah koneksi/limit, hasil error itu diteruskan ke pemanggil.
     let lastResult = { success: false, message: "Tidak ada endpoint GAS yang terpasang.", networkError: true };
-    for (let i = 0; i < APP_SCRIPT_URLS.length; i++) {
-        lastResult = await callGasAPIOnce_(APP_SCRIPT_URLS[i], action, { ...payload });
-        if (!lastResult.networkError) return lastResult; // sukses ATAU gagal karena alasan bisnis -> berhenti di sini
-        console.warn(`[Gwadeving] Endpoint GAS #${i + 1} gagal/limit, coba endpoint berikutnya...`);
+    for (let round = 0; round < 3; round++) {
+        for (let i = 0; i < APP_SCRIPT_URLS.length; i++) {
+            lastResult = await callGasAPIOnce_(APP_SCRIPT_URLS[i], action, { ...payload });
+            if (!lastResult.networkError) return lastResult; // sukses ATAU gagal karena alasan bisnis -> berhenti di sini
+            console.warn(`[Gwadeving] Endpoint GAS #${i + 1} gagal/limit, coba endpoint berikutnya...`);
+        }
+        if (round < 2) await sleep(600 * (round + 1));
     }
-    return lastResult; // semua endpoint gagal
+    return lastResult; // semua endpoint & semua percobaan ulang gagal
 }
 
 async function callGasAPIFetchOnce_(gasUrl, action, payload) {
@@ -637,11 +646,15 @@ async function callGasAPIFetchOnce_(gasUrl, action, payload) {
 }
 
 async function callGasAPIFetch(action, payload = {}) {
+    // FIX #4: sama seperti callGasAPI -- coba ulang sampai 3x siklus dulu.
     let lastResult = { success: false, message: "Tidak ada endpoint GAS yang terpasang.", networkError: true };
-    for (let i = 0; i < APP_SCRIPT_URLS.length; i++) {
-        lastResult = await callGasAPIFetchOnce_(APP_SCRIPT_URLS[i], action, { ...payload });
-        if (!lastResult.networkError) return lastResult;
-        console.warn(`[Gwadeving] Endpoint GAS #${i + 1} gagal/limit, coba endpoint berikutnya...`);
+    for (let round = 0; round < 3; round++) {
+        for (let i = 0; i < APP_SCRIPT_URLS.length; i++) {
+            lastResult = await callGasAPIFetchOnce_(APP_SCRIPT_URLS[i], action, { ...payload });
+            if (!lastResult.networkError) return lastResult;
+            console.warn(`[Gwadeving] Endpoint GAS #${i + 1} gagal/limit, coba endpoint berikutnya...`);
+        }
+        if (round < 2) await sleep(600 * (round + 1));
     }
     return lastResult;
 }
@@ -666,11 +679,15 @@ async function saveMetadataOnce_(gasUrl, action, payload) {
 }
 
 async function saveMetadataViaForm(payload, action = "save_metadata") {
+    // FIX #4: retry penuh sampai 3x siklus sebelum dianggap gagal permanen.
     let lastResult = { success: false, message: "Tidak ada endpoint GAS yang terpasang.", networkError: true };
-    for (let i = 0; i < APP_SCRIPT_URLS.length; i++) {
-        lastResult = await saveMetadataOnce_(APP_SCRIPT_URLS[i], action, { ...payload });
-        if (!lastResult.networkError) return lastResult;
-        console.warn(`[Gwadeving] Endpoint GAS #${i + 1} gagal/limit saat simpan metadata, coba endpoint berikutnya...`);
+    for (let round = 0; round < 3; round++) {
+        for (let i = 0; i < APP_SCRIPT_URLS.length; i++) {
+            lastResult = await saveMetadataOnce_(APP_SCRIPT_URLS[i], action, { ...payload });
+            if (!lastResult.networkError) return lastResult;
+            console.warn(`[Gwadeving] Endpoint GAS #${i + 1} gagal/limit saat simpan metadata, coba endpoint berikutnya...`);
+        }
+        if (round < 2) await sleep(600 * (round + 1));
     }
     return lastResult;
 }
@@ -718,6 +735,16 @@ function decField(str) {
 // ==========================================
 // BACA DARI SPREADSHEET (gviz)
 // ==========================================
+// FIX #4: bungkus gvizFetchSheet dengan retry (2x percobaan ulang) sebelum
+// benar-benar melempar error ke pemanggil (fetchRawSheets).
+async function gvizFetchSheetWithRetry_(sheetName, spreadsheetId, retries = 3) {
+    let lastErr;
+    for (let i = 0; i < retries; i++) {
+        try { return await gvizFetchSheet(sheetName, spreadsheetId); }
+        catch (e) { lastErr = e; if (i < retries - 1) await sleep(500 * (i + 1)); }
+    }
+    throw lastErr;
+}
 function gvizFetchSheet(sheetName, spreadsheetId) {
     spreadsheetId = spreadsheetId || SPREADSHEET_IDS[0];
     return new Promise((resolve, reject) => {
@@ -774,18 +801,51 @@ function reassembleLongField_(row, baseIndex, overflowStartIndex = 9) {
 }
 
 function decryptFileRows_(rows, overflowStartIndex = 9) {
-    // Kolom [1]=name, [2]=originalName, [6]=thumbId, [7]=chunksJSON dienkripsi di server.
-    // Didekripsi sekali di sini supaya semua kode lain (UI, halaman share, dll) otomatis
-    // menerima data plaintext tanpa perlu tahu soal enkripsi. Direkonstruksi dulu dari
-    // kolom overflow (kalau ada) SEBELUM didekripsi, supaya urutan karakternya tetap benar.
-    // PENTING: overflowStartIndex BEDA antara data aktif (index 9) dan data Trash (index 10),
-    // karena baris Trash punya 1 kolom tambahan ("expire") sebelum ownerId.
+    // FIX #6: backend sekarang mengenkripsi SEMUA kolom (bukan cuma
+    // name/originalName/thumbId/chunksJSON seperti sebelumnya) -- jadi
+    // kolom id(0)/format(3)/folder(4)/size(5)/ownerId(overflowStartIndex-1)
+    // ikut didekripsi di sini juga, supaya semua kode lain yang membaca
+    // raw.sheet1Rows/raw.trashRows tetap menerima data PLAINTEXT seperti biasa.
+    // Kolom 8 dipakai ownerId di data aktif (overflowStartIndex=9), kolom 9
+    // dipakai ownerId di data Trash (overflowStartIndex=10, karena ada kolom
+    // tambahan "expire" di index 8 yang juga sudah terenkripsi).
+    const ownerIdIndex = overflowStartIndex - 1;
     return rows.map(r => {
         const copy = r.slice();
+        if (copy.length > 0) copy[0] = decField(copy[0]);
         if (copy.length > 1) copy[1] = decField(reassembleLongField_(copy, 1, overflowStartIndex));
         if (copy.length > 2) copy[2] = decField(reassembleLongField_(copy, 2, overflowStartIndex));
+        if (copy.length > 3) copy[3] = decField(copy[3]);
+        if (copy.length > 4) copy[4] = decField(copy[4]);
+        if (copy.length > 5) copy[5] = Number(decField(copy[5])) || 0;
         if (copy.length > 6) copy[6] = decField(reassembleLongField_(copy, 6, overflowStartIndex));
         if (copy.length > 7) copy[7] = decField(reassembleLongField_(copy, 7, overflowStartIndex));
+        if (overflowStartIndex === 10 && copy.length > 8) copy[8] = decField(copy[8]); // expire (khusus Trash)
+        if (copy.length > ownerIdIndex) copy[ownerIdIndex] = decField(copy[ownerIdIndex]);
+        // Kolom overflow (index >= overflowStartIndex) sudah "menyatu" ke kolom 1/2/6/7
+        // lewat reassembleLongField_ -- potong supaya bentuk baris balik konsisten (9/10 kolom).
+        return copy.slice(0, overflowStartIndex);
+    });
+}
+
+// FIX #6: DB_03 (folder) sekarang juga terenkripsi penuh -- path (0) & ownerId (1).
+// Kolom 2 (createdDate) sudah terenkripsi sejak awal tapi tidak dipakai di client, dibiarkan.
+function decryptFolderRows_(rows) {
+    return rows.map(r => {
+        const copy = r.slice();
+        if (copy.length > 0) copy[0] = decField(copy[0]);
+        if (copy.length > 1) copy[1] = decField(copy[1]);
+        return copy;
+    });
+}
+
+// FIX #6: DB_05 (share) sekarang juga terenkripsi penuh: shareId(0), itemId(1),
+// itemType(2), ownerId(3), ownerName(4), privacy(5), allowedUsersJSON(6), linkRole(9).
+// Kolom 7/8 (createdAt/updatedAt) sudah terenkripsi sejak awal & tidak dipakai client.
+function decryptShareRows_(rows) {
+    return rows.map(r => {
+        const copy = r.slice();
+        [0, 1, 2, 3, 4, 5, 6, 9].forEach(idx => { if (copy.length > idx) copy[idx] = decField(copy[idx]); });
         return copy;
     });
 }
@@ -799,10 +859,10 @@ function decryptFileRows_(rows, overflowStartIndex = 9) {
 async function fetchRawSheets() {
     const results = await Promise.allSettled(SPREADSHEET_IDS.map(async (id) => {
         const [sheet1Rows, trashRows, folderRows, sharesRows] = await Promise.all([
-            gvizFetchSheet('DB_01', id),
-            gvizFetchSheet('DB_02', id),
-            gvizFetchSheet('DB_03', id),
-            gvizFetchSheet('DB_05', id)
+            gvizFetchSheetWithRetry_('DB_01', id),
+            gvizFetchSheetWithRetry_('DB_02', id),
+            gvizFetchSheetWithRetry_('DB_03', id),
+            gvizFetchSheetWithRetry_('DB_05', id)
         ]);
         return { sheet1Rows, trashRows, folderRows, sharesRows, id };
     }));
@@ -833,8 +893,8 @@ async function fetchRawSheets() {
     return {
         sheet1Rows: decryptFileRows_(dedupById(merged.sheet1Rows), 9),
         trashRows: decryptFileRows_(dedupById(merged.trashRows), 10),
-        folderRows: dedupById(merged.folderRows),
-        sharesRows: dedupById(merged.sharesRows)
+        folderRows: decryptFolderRows_(dedupById(merged.folderRows)),
+        sharesRows: decryptShareRows_(dedupById(merged.sharesRows))
     };
 }
 
@@ -1189,17 +1249,18 @@ function buildFolderCard_(fullFolderPath) {
         }
     }
 
-    // FIXED: Penggunaan backslash ganda (\\') agar kutip tidak merusak DOM HTML
+    // FIX #5: nama folder juga input pengguna -> escape sebelum ditaruh di innerHTML.
     const card = document.createElement('div'); card.className = `folder-card ${selectedFolderPaths.has(fullFolderPath) ? 'selected' : ''} ${isSelectingMode ? 'selecting' : ''}`;
+    const safeAttrPath = fullFolderPath.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
     card.innerHTML = `
-        <input type="checkbox" class="folder-checkbox" ${selectedFolderPaths.has(fullFolderPath) ? 'checked' : ''} onchange="toggleSelectFolder('${fullFolderPath.replace(/'/g, "\\'")}', this)">
+        <input type="checkbox" class="folder-checkbox" ${selectedFolderPaths.has(fullFolderPath) ? 'checked' : ''} onchange="toggleSelectFolder('${safeAttrPath}', this)">
         <div class="folder-icon-box"><span class="material-symbols-rounded">${folderIcon}</span></div>
         <div class="folder-info">
-            <span class="folder-name">${displayName}</span>
+            <span class="folder-name">${escapeHtml(displayName)}</span>
             <span class="folder-meta">${metaText}</span>
             ${shareBadgeHTML}
         </div>
-        <button class="icon-btn" style="padding:4px; margin-right:-4px;" onclick="openFolderOptions(event, '${fullFolderPath.replace(/'/g, "\\'")}')"><span class="material-symbols-rounded" style="font-size:22px;">more_vert</span></button>
+        <button class="icon-btn" style="padding:4px; margin-right:-4px;" onclick="openFolderOptions(event, '${safeAttrPath}')"><span class="material-symbols-rounded" style="font-size:22px;">more_vert</span></button>
     `;
     attachLongPressHandlers(card, () => { suppressNextClick=true; isSelectingMode=true; const chk=card.querySelector('.folder-checkbox'); chk.checked=!selectedFolderPaths.has(fullFolderPath); toggleSelectFolder(fullFolderPath,chk); }, (e) => { if(e.target.closest('button')||e.target.closest('input')) return; if(isSelectingMode){const chk=card.querySelector('.folder-checkbox');chk.checked=!chk.checked;toggleSelectFolder(fullFolderPath,chk);} else navigateToFolder(fullFolderPath); });
     return card;
@@ -1219,10 +1280,12 @@ function renderFolderTabOnly(filterText = '') {
         let metaText = `${stats.files} file`; if (stats.size > 0) metaText += ` • ${formatBytes(stats.size)}`;
         const card = document.createElement('div'); card.className = 'folder-card';
         card.onclick = (e) => { if (!e.target.closest('button')) navigateToFolder(fullFolderPath); };
+        // FIX #5: escape teks + escape atribut onclick (dulu tidak di-escape sama sekali di sini).
+        const safeAttrPath = fullFolderPath.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
         card.innerHTML = `
             <div class="folder-icon-box"><span class="material-symbols-rounded">folder</span></div>
-            <div class="folder-info"><span class="folder-name">${fullFolderPath}</span><span class="folder-meta">${metaText}</span></div>
-            <button class="icon-btn" style="padding:4px; margin-right:-4px;" onclick="openFolderOptions(event, '${fullFolderPath}')"><span class="material-symbols-rounded" style="font-size:22px;">more_vert</span></button>
+            <div class="folder-info"><span class="folder-name">${escapeHtml(fullFolderPath)}</span><span class="folder-meta">${metaText}</span></div>
+            <button class="icon-btn" style="padding:4px; margin-right:-4px;" onclick="openFolderOptions(event, '${safeAttrPath}')"><span class="material-symbols-rounded" style="font-size:22px;">more_vert</span></button>
         `;
         return card;
     }, `<div style="grid-column:1/-1; text-align:center; padding:60px 20px; color:var(--text-muted); font-size:14px;">Belum ada folder.</div>`);
@@ -1296,12 +1359,16 @@ function buildFileCard_(f) {
     
     let subText = ext === 'sys_folder' ? 'Folder (Sampah)' : formatBytes(f.size);
 
+    // FIX #5: nama file berasal dari input pengguna (bisa diisi siapa saja lewat
+    // upload/rename/share), jadi WAJIB di-escape sebelum ditaruh di innerHTML,
+    // supaya tidak bisa dipakai untuk XSS (mis. nama file "<img src=x onerror=...>").
+    const safeFilename = escapeHtml(displayFilename);
     card.innerHTML = `
         <input type="checkbox" class="file-checkbox" ${isSelected ? 'checked' : ''} onchange="toggleSelectFile('${f.id}', this)">
         <button class="icon-btn file-menu-btn" onclick="openFileMenu(event, '${f.id}')"><span class="material-symbols-rounded" style="font-size:20px;">more_vert</span></button>
         <div class="file-thumbnail" id="thumb-${f.id}"><span class="material-symbols-rounded" style="font-size:42px; ${ext === 'sys_folder' ? 'color: var(--primary);' : ''}">${initialIcon}</span></div>
         <div class="file-info-area">
-            <span class="file-title-text" title="${displayFilename}">${displayFilename}</span>
+            <span class="file-title-text" title="${safeFilename}">${safeFilename}</span>
             <span class="file-sub">${subText}</span>
             ${publicBadgeHTML}
         </div>
@@ -1642,6 +1709,10 @@ async function createFolder() {
     const input = document.getElementById('new-folder-name');
     const folderName = input.value.trim();
     if (!folderName) return showToast("Nama folder tidak boleh kosong.", true);
+    // FIX #5/#7: validasi panjang di client (sinkron dengan batas di server) supaya
+    // langsung dapat feedback jelas, bukan silently gagal/terpotong di spreadsheet.
+    if (folderName.length > 300) return showToast("Nama folder terlalu panjang (maksimal 300 karakter).", true);
+    if (/[<>]/.test(folderName)) return showToast("Nama folder tidak boleh mengandung karakter < atau >.", true);
     const fullPath = currentPath ? `${currentPath}/${folderName}` : folderName;
     closeCreateFolderModal(); showLoadingOverlay("Membuat folder...", false, false);
     const res = await callGasAPI('create_folder', { folderPath: fullPath, ownerId: currentOwnerId });
@@ -1907,6 +1978,9 @@ function openRenameModal() {
 function closeRenameModal() { document.getElementById('rename-modal').style.display = 'none'; }
 function executeRenameFile() {
     let newName = document.getElementById('rename-input').value.trim();
+    // FIX #5/#7: validasi panjang & karakter berbahaya sebelum dikirim.
+    if (newName.length > 300) { showToast("Nama file terlalu panjang (maksimal 300 karakter).", true); return; }
+    if (/[<>]/.test(newName)) { showToast("Nama file tidak boleh mengandung karakter < atau >.", true); return; }
     if (newName && newName !== selectedFileForAction.name) {
         selectedFileForAction.name = newName;
         callGasAPI('rename_file', { fileId: selectedFileForAction.id, newName: newName, ownerId: currentOwnerId });
@@ -2199,11 +2273,13 @@ function renderUploadQueue() {
     uploadQueue.forEach((qItem, index) => {
         const disableAttr = isUploadInProgress ? 'disabled' : '';
         const opacity = isUploadInProgress ? '0.6' : '1';
+        // FIX #5: value attribute wajib di-escape (kalau nama file mengandung tanda kutip
+        // dua bisa "kabur" dari atribut lalu menyisipkan HTML/JS lain).
         htmlContent += `
             <div style="display:flex; align-items:center; gap:8px; margin-bottom: 8px; opacity:${opacity};">
                 <div class="inline-input-group" style="margin-bottom:0; flex:1;">
-                    <input type="text" value="${qItem.customName}" oninput="updateQueueName(${index}, this.value)" placeholder="Nama berkas..." ${disableAttr}>
-                    <span class="ext-label" style="min-width: 50px; text-align: center;">${qItem.ext ? '.' + qItem.ext : ''}</span>
+                    <input type="text" value="${escapeHtml(qItem.customName)}" oninput="updateQueueName(${index}, this.value)" placeholder="Nama berkas..." ${disableAttr}>
+                    <span class="ext-label" style="min-width: 50px; text-align: center;">${escapeHtml(qItem.ext ? '.' + qItem.ext : '')}</span>
                 </div>
                 <span style="font-size:11.5px; color:var(--text-muted); flex-shrink:0; min-width:56px; text-align:right;">${formatBytes(qItem.file ? qItem.file.size : 0)}</span>
                 <button class="icon-btn" style="color:var(--danger); padding:8px; background:var(--danger-light); border-radius:var(--radius-sm); flex-shrink: 0;" onclick="removeFromQueue(${index})" title="Hapus" ${disableAttr}><span class="material-symbols-rounded" style="font-size:18px;">delete</span></button>
@@ -2330,7 +2406,14 @@ function generateVideoThumbnail(file) {
                     
                     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
                     
-                    canvas.toBlob((blob) => cleanup(blob), 'image/jpeg', 0.75);
+                    // FIX #2: thumbnail disimpan sebagai WEBP (bukan JPEG) dan dijamin
+                    // maksimal 5MB lewat convertImageToWebP yang sudah dipakai untuk
+                    // thumbnail gambar, supaya konsisten & ringan saat di-load.
+                    canvas.toBlob(async (blob) => {
+                        if (!blob) return cleanup(null);
+                        try { cleanup(await convertImageToWebP(blob, 5 * 1024 * 1024)); }
+                        catch (e) { cleanup(blob); }
+                    }, 'image/jpeg', 0.9);
                 } catch (e) { cleanup(null); }
             }, 400); 
         });
@@ -2690,12 +2773,13 @@ function renderAllowedUsersList() {
     shareCtx.allowedUsers.forEach((u, idx) => {
         const isEdit = u.role === 'edit';
         const row = document.createElement('div'); row.className = 'allowed-user-row';
+        // FIX #5: username orang lain (bisa didaftarkan siapa saja) -> escape dulu.
         row.innerHTML = `
             <div class="allowed-user-info">
                 <div class="user-avatar"><span class="material-symbols-rounded" style="font-size:18px;">person</span></div>
                 <div class="text-wrap">
-                    <span class="usr-name">${u.username}</span>
-                    <span class="usr-id">ID: ${u.uid}</span>
+                    <span class="usr-name">${escapeHtml(u.username)}</span>
+                    <span class="usr-id">ID: ${escapeHtml(u.uid)}</span>
                 </div>
             </div>
             <button type="button" class="role-toggle-pill ${isEdit ? 'is-edit' : ''}" onclick="toggleUserRole(${idx})" title="Ganti peran (Lihat/Edit)">
@@ -2727,11 +2811,12 @@ function onShareUserSearchInput() {
                 if (shareCtx.allowedUsers.some(a => a.uid === u.uid)) return;
 
                 const item = document.createElement('div'); item.className = 'user-search-item';
+                // FIX #5: escape username sebelum ditaruh di innerHTML.
                 item.innerHTML = `
                     <div class="user-avatar"><span class="material-symbols-rounded" style="font-size:20px;">person</span></div>
                     <div class="user-details">
-                        <span class="usr-name">${u.username}</span>
-                        <span class="usr-id">ID: ${u.uid}</span>
+                        <span class="usr-name">${escapeHtml(u.username)}</span>
+                        <span class="usr-id">ID: ${escapeHtml(u.uid)}</span>
                     </div>
                 `;
                 item.onclick = () => addUserToShareList(u);
@@ -3689,7 +3774,7 @@ async function renderPreviewContent(url, ext, container, blob) {
             // sudah 'image/webp'), JANGAN ekstrak ulang — itu cover-nya sendiri sudah
             // valid untuk ditampilkan langsung. Ekstraksi exifr cuma perlu dilakukan
             // kalau blob yang dikirim memang masih file RAW mentah aslinya.
-            if (['cr2','nef','arw','dng','raw','rw2','orf','pef','srw'].includes(ext) && blob && blob.type !== 'image/webp') {
+            if (['cr2','nef','arw','dng','raw','rw2','orf','pef','srw','heic','heif'].includes(ext) && blob && blob.type !== 'image/webp') {
                 try {
                     const thumbData = await extractRawEmbeddedPreview(blob);
                     if (thumbData) {
@@ -3709,12 +3794,22 @@ async function renderPreviewContent(url, ext, container, blob) {
             const imgStyle = isRawExtractedPreview
                 ? 'width:100%; max-height:85vh; object-fit:contain; border-radius:10px;'
                 : 'max-width:100%; max-height:85vh; object-fit:contain; border-radius:10px;';
-            container.innerHTML=`<div style="display:flex;align-items:center;justify-content:center;width:100%;height:100%;"><img class="preview-media" src="${displayUrl}" alt="Preview" style="${imgStyle}" onerror="this.closest('div').innerHTML='<div style=&quot;color:#fff;text-align:center;max-width:420px;&quot;><span class=&quot;material-symbols-rounded&quot; style=&quot;font-size:48px;&quot;>broken_image</span><p style=&quot;margin-top:10px;font-size:13px;&quot;>File RAW ini tidak menyertakan preview JPEG bawaan, browser tidak bisa menampilkannya langsung. Silakan download filenya.</p></div>'"></div>`; 
+            // FIX #3: pesan fallback digeneralisasi (dulu selalu bilang "File RAW"
+            // walau yang gagal tampil bisa juga HEIC/format lain) + selalu tawarkan
+            // tombol download supaya user tetap bisa akses filenya.
+            container.innerHTML=`<div style="display:flex;align-items:center;justify-content:center;width:100%;height:100%;"><img class="preview-media" src="${displayUrl}" alt="Preview" style="${imgStyle}" onerror="this.closest('div').innerHTML='<div style=&quot;color:#fff;text-align:center;max-width:420px;&quot;><span class=&quot;material-symbols-rounded&quot; style=&quot;font-size:48px;&quot;>broken_image</span><p style=&quot;margin-top:10px;font-size:13px;&quot;>Browser Anda tidak bisa menampilkan pratinjau format ini secara langsung.</p><button class=&quot;btn-primary&quot; style=&quot;margin-top:14px;padding:8px 18px;&quot; onclick=&quot;downloadSelectedFile()&quot;>Download Berkas</button></div>'"></div>`; 
             return;
         }
         if (VIDEO_EXTENSIONS.has(ext)) {
-            const u=trackPreviewUrl(url); container.innerHTML=`<video id="preview-video" class="preview-media" controls playsinline preload="metadata" src="${u}" style="max-height:85vh;"></video>`;
-            const v=document.getElementById('preview-video'); if(window.Plyr) plyrPlayer=new Plyr(v); return;
+            const u=trackPreviewUrl(url); 
+            // FIX #3: pasang listener 'error' -- beberapa codec di dalam mkv/mov/avi
+            // tidak didukung native oleh browser, video tag akan diam saja tanpa ini.
+            container.innerHTML=`<video id="preview-video" class="preview-media" controls playsinline preload="metadata" src="${u}" style="max-height:85vh;"></video>`;
+            const v=document.getElementById('preview-video');
+            v.addEventListener('error', () => {
+                container.innerHTML = `<div style="color:#fff;text-align:center;max-width:420px;"><span class="material-symbols-rounded" style="font-size:48px;">movie_off</span><p style="margin-top:10px;font-size:13px;">Video ini memakai codec yang tidak didukung browser Anda dan tidak bisa diputar langsung.</p><button class="btn-primary" style="margin-top:14px;padding:8px 18px;" onclick="downloadSelectedFile()">Download Berkas</button></div>`;
+            });
+            if(window.Plyr) plyrPlayer=new Plyr(v); return;
         }
         if (AUDIO_EXTENSIONS.has(ext)) { drawAudioWave(container,url); return; }
         if (ext==='pdf') {
