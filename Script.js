@@ -117,7 +117,6 @@ let currentOwnerId = '';
 let fileUrlCache = {};
 let selectedFileIds = new Set();
 let isSelectingMode = false;
-let plyrPlayer = null;
 let selectedFolderForAction = '';
 let selectedFileForAction = null;
 let suppressNextClick = false;
@@ -1893,7 +1892,8 @@ async function extractRawEmbeddedPreview(blobOrFile, timeoutMs = 15000) {
     // buat ditampilkan besar). Padahal kebanyakan file RAW kamera juga
     // menyimpan preview kedua yang jauh lebih besar (mid/full-res) di
     // lokasi IFD lain. Sekarang kita kumpulkan SEMUA kandidat gambar
-    // yang ketemu, lalu pakai yang PALING BESAR ukuran byte-nya.
+    // yang ketemu, lalu pakai yang PALING BESAR ukuran byte-nya YANG
+    // TERBUKTI BISA DIDEKODE (lihat validasi di bawah).
     const candidates = [];
     let buf = null;
     try { buf = await blobOrFile.arrayBuffer(); } catch (e) { return null; }
@@ -1937,11 +1937,83 @@ async function extractRawEmbeddedPreview(blobOrFile, timeoutMs = 15000) {
         });
     } catch (e) { /* memang tidak ada tag preview tambahan di file ini */ }
 
-    if (candidates.length === 0) return null; // File ini benar-benar tidak menyertakan preview JPEG.
-    // Pilih kandidat dengan ukuran byte terbesar -> biasanya itu yang
-    // resolusinya paling tinggi / paling layak ditampilkan penuh.
-    return candidates.reduce((best, c) => (c.byteLength > best.byteLength ? c : best));
+    // PATCH: kandidat cadangan TERAKHIR -- pindai LANGSUNG seluruh isi
+    // byte file cari penanda awal/akhir JPEG (SOI 0xFFD8 ... EOI 0xFFD9).
+    // Ini jaring pengaman untuk kasus yang sebelumnya bikin thumbnail
+    // "gagal tergenerate": HEIC (bukan struktur TIFF, jadi tag IFD0/IFD1
+    // di atas tidak ketemu apa-apa) dan varian RAW yang preview-nya
+    // disimpan produsen kamera di lokasi non-standar (bukan di tag resmi
+    // ThumbnailOffset/JpegIFOffset). Hampir semua format ini tetap
+    // menyimpan minimal 1 JPEG mentah di dalam filenya (dipakai kamera
+    // untuk preview di layar LCD), jadi pemindaian ini nyaris selalu
+    // berhasil menemukan sesuatu walau tag metadata-nya tidak baku.
+    //
+    // Sengaja disiapkan (bukan langsung dijalankan) di sini -- baru
+    // benar-benar dipakai di bawah, HANYA kalau kandidat dari tag metadata
+    // ternyata tidak ada satupun yang valid saat divalidasi.
+    const runByteScanFallback = () => { try { return scanForEmbeddedJpegs(buf); } catch (e) { return []; } };
+
+    // PATCH: dulu kandidat terbesar langsung dipakai tanpa dicek dulu --
+    // kalau ternyata potongan byte-nya korup/kepotong (mis. salah tebak
+    // offset), thumbnail "tergenerate" tapi gambarnya rusak pas
+    // ditampilkan. Sekarang setiap kandidat divalidasi dulu (coba
+    // benar-benar didekode browser), mulai dari yang paling besar; yang
+    // pertama TERBUKTI valid itu yang dipakai. Kalau SEMUA kandidat dari
+    // tag metadata ternyata korup/tidak valid, baru jalankan pemindaian
+    // byte mentah di atas sebagai upaya terakhir.
+    const validateAndPick = async (list) => {
+        list.sort((a, b) => b.byteLength - a.byteLength);
+        for (const c of list) {
+            try {
+                const testBlob = new Blob([c], { type: 'image/jpeg' });
+                const bitmap = await Promise.race([
+                    createImageBitmap(testBlob),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('decode timeout')), 4000))
+                ]);
+                if (bitmap) { bitmap.close?.(); return c; }
+            } catch (e) { /* kandidat ini korup/tidak bisa didekode, coba kandidat berikutnya */ }
+        }
+        return null;
+    };
+
+    let result = candidates.length > 0 ? await validateAndPick(candidates) : null;
+    if (!result) {
+        const scanned = runByteScanFallback();
+        if (scanned.length > 0) result = await validateAndPick(scanned);
+    }
+    return result; // null kalau benar-benar tidak ada preview JPEG valid sama sekali di file ini
 }
+
+// Pindai buffer mentah cari semua segmen JPEG utuh (SOI...EOI). Dipakai
+// sebagai jaring pengaman terakhir di extractRawEmbeddedPreview() di atas.
+function scanForEmbeddedJpegs(buf) {
+    const bytes = new Uint8Array(buf);
+    const results = [];
+    const MIN_SIZE = 4000; // buang potongan kecil yang cuma noise/ikon
+    let i = 0;
+    while (i < bytes.length - 1) {
+        if (bytes[i] === 0xFF && bytes[i + 1] === 0xD8) {
+            let j = i + 2;
+            let end = -1;
+            while (j < bytes.length - 1) {
+                if (bytes[j] === 0xFF && bytes[j + 1] === 0xD9) { end = j + 2; break; }
+                j++;
+            }
+            if (end !== -1) {
+                if (end - i >= MIN_SIZE) results.push(bytes.slice(i, end).buffer);
+                i = end; // lompat ke akhir segmen ini, lanjut cari segmen berikutnya
+                continue;
+            } else {
+                break; // SOI tanpa EOI (kepotong) -- berhenti, sisanya bukan JPEG utuh
+            }
+        }
+        i++;
+    }
+    // Kalau ketemu banyak, batasi jumlah kandidat yang divalidasi (largest-first
+    // di pemanggil) supaya tidak buang waktu decode berkali-kali.
+    return results.slice(0, 4);
+}
+
 
 async function parseAndShowExif(urlOrBlob, container) {
     const exifrReady = await ensureExifrLoaded();
@@ -2227,12 +2299,28 @@ async function loadCardThumbnail(file, ext, containerId) {
 }
 function applyThumbToContainer(url, ext, containerId) {
     const container = document.getElementById(containerId); if (!container) return;
+    // PATCH: sebelumnya <img> di sini tidak punya handler onerror sama
+    // sekali -- kalau thumbnail-nya ternyata gagal dimuat/rusak (mis. cache
+    // URL sudah kedaluwarsa, atau konten thumb-nya bukan gambar valid),
+    // browser cuma nampilin ikon "gambar pecah" dan diam untuk selamanya.
+    // Sekarang: begitu <img> gagal load, hapus entri cache URL-nya (biar
+    // percobaan berikutnya fetch ulang, bukan kepakai cache yang rusak
+    // terus-terusan) dan kembalikan tampilan ke ikon file biasa.
+    const iconFallback = VIDEO_EXTENSIONS.has(ext) ? 'movie' : 'image';
+    const onErrorAttr = `onerror="handleThumbLoadError(this, '${containerId}', '${iconFallback}')"`;
     if (VIDEO_EXTENSIONS.has(ext)) { 
-        container.innerHTML = `<img src="${url}" style="width:100%; height:100%; object-fit:cover;" loading="lazy"><div class="video-play-overlay"><div class="play-badge"><span class="material-symbols-rounded">play_arrow</span></div></div>`; 
+        container.innerHTML = `<img src="${url}" style="width:100%; height:100%; object-fit:cover;" loading="lazy" ${onErrorAttr}><div class="video-play-overlay"><div class="play-badge"><span class="material-symbols-rounded">play_arrow</span></div></div>`; 
     }
     else if (IMAGE_EXTENSIONS.has(ext)) { 
-        container.innerHTML = `<img src="${url}" alt="Thumb" loading="lazy">`; 
+        container.innerHTML = `<img src="${url}" alt="Thumb" loading="lazy" ${onErrorAttr}>`; 
     }
+}
+function handleThumbLoadError(imgEl, containerId, iconName) {
+    // Buang cache URL thumbnail yang ternyata gagal dimuat supaya tidak
+    // terus dipakai ulang di kartu/preview lain.
+    for (const key in fileUrlCache) { if (fileUrlCache[key] === imgEl.src) delete fileUrlCache[key]; }
+    const container = document.getElementById(containerId); if (!container) return;
+    container.innerHTML = `<span class="material-symbols-rounded" style="font-size:42px;">${iconName}</span>`;
 }
 
 // ==========================================
@@ -2411,7 +2499,15 @@ function generateVideoThumbnail(file) {
                     // thumbnail gambar, supaya konsisten & ringan saat di-load.
                     canvas.toBlob(async (blob) => {
                         if (!blob) return cleanup(null);
-                        try { cleanup(await convertImageToWebP(blob, 5 * 1024 * 1024)); }
+                        try {
+                            // canvas.toBlob() di atas SUDAH PASTI menghasilkan JPEG yang valid
+                            // (baru dibuat dari frame video, bukan file luar yang tidak jelas
+                            // asalnya) -- jadi kalau convertImageToWebP gagal/null (kompresi
+                            // webp-nya yang gagal, bukan gambarnya yang rusak), tetap pakai
+                            // JPEG mentah ini apa adanya daripada dibuang jadi null.
+                            const converted = await convertImageToWebP(blob, 5 * 1024 * 1024);
+                            cleanup(converted || blob);
+                        }
                         catch (e) { cleanup(blob); }
                     }, 'image/jpeg', 0.9);
                 } catch (e) { cleanup(null); }
@@ -2502,23 +2598,55 @@ async function startMultiUpload() {
         else if (IMAGE_EXTENSIONS.has(format)) {
             sText.innerHTML = `${prefix}Menyiapkan preview image...`;
             let previewBlob = null;
-            
+            let extractedJpegFallback = null;
+
+            // 1) Coba decode & kompres LANGSUNG dari file aslinya dulu.
+            //    convertImageToWebP() sekarang mencoba 2 cara decode native
+            //    browser (createImageBitmap, lalu <img> tag) sebelum dianggap
+            //    gagal. Untuk format biasa (jpg/png/webp/gif/bmp/avif/dll) ini
+            //    SELALU berhasil di sini. Untuk sebagian HEIC ini juga bisa
+            //    berhasil (browser dgn dukungan HEIC native) -- hasilnya foto
+            //    asli penuh, bukan cuma preview kecil ter-embed.
             try {
-                let processBlob = fileInput;
-                if (['cr2','nef','arw','dng','raw','rw2','orf','pef','srw'].includes(format)) {
-                    // Pakai helper ekstraksi yang andal (baca file penuh + fallback
-                    // manual offset), bukan cuma exifr.thumbnail() polos.
-                    const u8 = await extractRawEmbeddedPreview(fileInput);
-                    if (u8) processBlob = new Blob([u8], { type: 'image/jpeg' });
-                }
                 previewBlob = await Promise.race([
-                    convertImageToWebP(processBlob, 5 * 1024 * 1024),
-                    new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 4000))
+                    convertImageToWebP(fileInput, 5 * 1024 * 1024),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 9000))
                 ]);
-            } catch(e) {
-                previewBlob = fileInput; // Fallback ke file asli jika kompresi gagal
+            } catch (e) { previewBlob = null; }
+
+            // 2) Kalau langkah 1 gagal -- ini yang terjadi untuk SEMUA format
+            //    RAW kamera (memang tidak ada browser yang bisa mendekode RAW
+            //    lewat <canvas>/<img>) dan HEIC di browser tanpa dukungan
+            //    native -- ekstrak preview JPEG yang SUDAH ter-embed di dalam
+            //    file itu sendiri lewat extractRawEmbeddedPreview(). Fungsi
+            //    itu: (a) baca tag resmi ThumbnailOffset/JpegIFOffset,
+            //    (b) kalau tidak ketemu/tidak valid, pindai SELURUH byte file
+            //    cari penanda JPEG secara langsung, dan (c) SETIAP kandidat
+            //    yang ditemukan WAJIB lolos tes decode ulang sebelum
+            //    dikembalikan. Jadi begitu fungsi ini balikin sesuatu, itu
+            //    sudah pasti valid & bisa ditampilkan -- bukan tebakan lagi.
+            if (!previewBlob && ['cr2','nef','arw','dng','raw','rw2','orf','pef','srw','heic','heif'].includes(format)) {
+                try {
+                    const u8 = await extractRawEmbeddedPreview(fileInput);
+                    if (u8) {
+                        const extracted = new Blob([u8], { type: 'image/jpeg' });
+                        extractedJpegFallback = extracted; // sudah tervalidasi bisa didekode
+                        try {
+                            previewBlob = await Promise.race([
+                                convertImageToWebP(extracted, 5 * 1024 * 1024),
+                                new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 9000))
+                            ]);
+                        } catch (e) { previewBlob = null; }
+                    }
+                } catch (e) { /* memang tidak ada preview JPEG apa pun yang bisa ditemukan di file ini */ }
             }
-            
+
+            // Kalau kompresi webp di atas gagal/timeout tapi kita sudah punya
+            // hasil ekstraksi yang TERVALIDASI valid, pakai itu apa adanya
+            // (belum dikompres, tapi dijamin bisa ditampilkan) -- daripada
+            // tidak punya thumbnail sama sekali.
+            if (!previewBlob && extractedJpegFallback) previewBlob = extractedJpegFallback;
+
             if (previewBlob) {
                 const fdThumb = new FormData(); 
                 fdThumb.append('chat_id', TELEGRAM_CHAT_ID); 
@@ -3524,26 +3652,62 @@ function escapeHtml(s) { return String(s ?? '').replace(/[&<>'"]/g, c => ({'&':'
 function previewLoading(container, text='Memuat pratinjau...', percent=null) {
     container.innerHTML = `<div style="width:min(520px,90%);text-align:center;color:#fff;"><div class="spinner" style="margin:auto;border-color:rgba(255,255,255,.2);border-top-color:var(--accent);"></div><p style="margin-top:12px;">${escapeHtml(text)}</p>${percent!==null?`<div class="progress-track preview-progress" style="margin:14px auto 0;background:rgba(255,255,255,.15)"><div class="progress-fill" id="preview-progress-bar" style="width:${percent}%"></div></div><div id="preview-progress-text" style="margin-top:7px;font-size:12px;opacity:.8">${percent}%</div>`:''}</div>`;
 }
+// Jalur decode native KEDUA -- dipakai kalau createImageBitmap gagal.
+// Sebagian browser/versi punya dukungan codec yang beda antara API
+// createImageBitmap vs elemen <img> biasa (mis. sebagian kasus HEIC/AVIF),
+// jadi ini kesempatan kedua sebelum benar-benar dianggap "tidak bisa
+// didekode sama sekali".
+function tryDecodeViaImgTag(blob, timeoutMs = 4000) {
+    return new Promise((resolve) => {
+        const url = URL.createObjectURL(blob);
+        let done = false;
+        const finish = (val) => { if (done) return; done = true; try { URL.revokeObjectURL(url); } catch(e){} resolve(val); };
+        const timer = setTimeout(() => finish(null), timeoutMs);
+        const img = new Image();
+        img.onload = () => {
+            clearTimeout(timer);
+            try {
+                const w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+                if (!w || !h) { finish(null); return; }
+                const canvas = document.createElement('canvas');
+                canvas.width = w; canvas.height = h;
+                canvas.getContext('2d').drawImage(img, 0, 0);
+                finish(canvas);
+            } catch (e) { finish(null); }
+        };
+        img.onerror = () => { clearTimeout(timer); finish(null); };
+        img.src = url;
+    });
+}
+
 async function convertImageToWebP(blob, maxBytes=5*1024*1024) {
-    if (!blob || !String(blob.type).startsWith('image/')) return blob;
+    if (!blob || !String(blob.type).startsWith('image/')) return null;
     if (blob.type === 'image/webp' && blob.size <= maxBytes) return blob;
-    const bitmap = await createImageBitmap(blob).catch(()=>null);
-    if (!bitmap) return blob;
+
+    // PATCH: dulu cuma coba 1 cara decode (createImageBitmap) -- kalau itu
+    // gagal langsung nyerah. Sekarang dicoba 2 cara sebelum benar2 nyerah,
+    // supaya lebih banyak kasus format "aneh" tetap berhasil didekode.
+    let source = await createImageBitmap(blob).catch(()=>null);
+    let isBitmap = !!source;
+    if (!source) source = await tryDecodeViaImgTag(blob);
+    if (!source) return null; // benar-benar tidak ada satupun cara browser ini bisa mendekodenya
+
+    let w = source.width, h = source.height;
     let scale = Math.min(1, Math.sqrt(maxBytes / Math.max(blob.size,1)) * 1.25);
-    let w = Math.max(1, Math.round(bitmap.width * scale)), h = Math.max(1, Math.round(bitmap.height * scale));
+    w = Math.max(1, Math.round(w * scale)); h = Math.max(1, Math.round(h * scale));
     for (let attempt=0; attempt<6; attempt++) {
         const canvas=document.createElement('canvas'); canvas.width=w; canvas.height=h;
-        const ctx=canvas.getContext('2d'); ctx.drawImage(bitmap,0,0,w,h);
+        const ctx=canvas.getContext('2d'); ctx.drawImage(source,0,0,w,h);
         let quality=0.86;
         for (let q=0;q<7;q++) {
             const out=await new Promise(r=>canvas.toBlob(r,'image/webp',quality));
-            if (out && out.size<=maxBytes) { bitmap.close?.(); return out; }
+            if (out && out.size<=maxBytes) { if (isBitmap) source.close?.(); return out; }
             quality-=0.08;
         }
         w=Math.max(320,Math.round(w*.72)); h=Math.max(320,Math.round(h*.72));
     }
-    bitmap.close?.();
-    return blob;
+    if (isBitmap) source.close?.();
+    return null;
 }
 
 async function drawAudioWave(container, audioUrl) {
@@ -3802,14 +3966,20 @@ async function renderPreviewContent(url, ext, container, blob) {
         }
         if (VIDEO_EXTENSIONS.has(ext)) {
             const u=trackPreviewUrl(url); 
+            // PATCH: player video sebelumnya pakai library Plyr (kontrolnya
+            // bawaan library, ikut style default Plyr). Sekarang diganti
+            // dengan UI player buatan sendiri: tombol play/pause, volume,
+            // timeline yang bisa digeser, dan penunjuk durasi -- lihat
+            // initCustomVideoPlayer() di bawah.
+            container.innerHTML = buildCustomVideoPlayerHTML(u);
+            const v = document.getElementById('preview-video');
             // FIX #3: pasang listener 'error' -- beberapa codec di dalam mkv/mov/avi
             // tidak didukung native oleh browser, video tag akan diam saja tanpa ini.
-            container.innerHTML=`<video id="preview-video" class="preview-media" controls playsinline preload="metadata" src="${u}" style="max-height:85vh;"></video>`;
-            const v=document.getElementById('preview-video');
             v.addEventListener('error', () => {
                 container.innerHTML = `<div style="color:#fff;text-align:center;max-width:420px;"><span class="material-symbols-rounded" style="font-size:48px;">movie_off</span><p style="margin-top:10px;font-size:13px;">Video ini memakai codec yang tidak didukung browser Anda dan tidak bisa diputar langsung.</p><button class="btn-primary" style="margin-top:14px;padding:8px 18px;" onclick="downloadSelectedFile()">Download Berkas</button></div>`;
             });
-            if(window.Plyr) plyrPlayer=new Plyr(v); return;
+            initCustomVideoPlayer(v);
+            return;
         }
         if (AUDIO_EXTENSIONS.has(ext)) { drawAudioWave(container,url); return; }
         if (ext==='pdf') {
@@ -3849,6 +4019,147 @@ async function renderPreviewContent(url, ext, container, blob) {
         
         container.innerHTML=`<div style="color:#fff;text-align:center;max-width:520px;padding:20px;"><span class="material-symbols-rounded" style="font-size:54px;">draft</span><p style="margin-top:12px">Preview untuk <b>.${escapeHtml(ext||'file')}</b> belum didukung browser.</p></div>`;
     } catch(e) { container.innerHTML=`<div style="color:#ef4444;text-align:center;padding:24px;">Gagal memuat preview: ${escapeHtml(e.message)}</div>`; }
+}
+
+// ==========================================
+// CUSTOM VIDEO PLAYER (ganti Plyr)
+// Player video sendiri: play/pause, volume, timeline geser + durasi.
+// Video-nya sendiri tetap di-stream lewat Cloudflare Worker seperti
+// sebelumnya -- yang diganti cuma UI kontrolnya.
+// ==========================================
+function buildCustomVideoPlayerHTML(src) {
+    return `
+    <div class="custom-video-player" id="custom-video-wrap">
+        <video id="preview-video" class="preview-media" playsinline preload="metadata" src="${src}"></video>
+        <div class="video-center-btn" id="video-center-btn"><span class="material-symbols-rounded">play_arrow</span></div>
+        <div class="video-spinner" id="video-spinner" style="display:none;"><span class="spinner"></span></div>
+        <div class="video-controls-bar" id="video-controls-bar">
+            <div class="video-seek-wrap" id="video-seek-wrap">
+                <div class="video-seek-buffered" id="video-seek-buffered"></div>
+                <div class="video-seek-played" id="video-seek-played"></div>
+                <div class="video-seek-handle" id="video-seek-handle"></div>
+            </div>
+            <div class="video-controls-row">
+                <button type="button" class="video-ctrl-btn" id="video-btn-play" title="Play/Pause"><span class="material-symbols-rounded">play_arrow</span></button>
+                <span class="video-time" id="video-time-current">00:00</span>
+                <span class="video-time-sep">/</span>
+                <span class="video-time" id="video-time-duration">00:00</span>
+                <div class="video-ctrl-spacer"></div>
+                <button type="button" class="video-ctrl-btn" id="video-btn-mute" title="Bisukan"><span class="material-symbols-rounded">volume_up</span></button>
+                <input type="range" id="video-volume" class="video-volume-slider" min="0" max="1" step="0.01" value="1" title="Volume">
+                <button type="button" class="video-ctrl-btn" id="video-btn-fullscreen" title="Layar Penuh"><span class="material-symbols-rounded">fullscreen</span></button>
+            </div>
+        </div>
+    </div>`;
+}
+
+function formatVideoTime(sec) {
+    if (!isFinite(sec) || sec < 0) sec = 0;
+    sec = Math.floor(sec);
+    const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+    const pad = (n) => String(n).padStart(2, '0');
+    return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
+}
+
+function initCustomVideoPlayer(video) {
+    const wrap = document.getElementById('custom-video-wrap');
+    if (!wrap || !video) return;
+    const seekWrap = document.getElementById('video-seek-wrap');
+    const seekPlayed = document.getElementById('video-seek-played');
+    const seekBuffered = document.getElementById('video-seek-buffered');
+    const seekHandle = document.getElementById('video-seek-handle');
+    const btnPlay = document.getElementById('video-btn-play');
+    const btnMute = document.getElementById('video-btn-mute');
+    const btnFullscreen = document.getElementById('video-btn-fullscreen');
+    const volumeSlider = document.getElementById('video-volume');
+    const timeCurrent = document.getElementById('video-time-current');
+    const timeDuration = document.getElementById('video-time-duration');
+    const centerBtn = document.getElementById('video-center-btn');
+    const spinner = document.getElementById('video-spinner');
+    const controlsBar = document.getElementById('video-controls-bar');
+
+    const setPlayIcon = (isPlaying) => {
+        btnPlay.innerHTML = `<span class="material-symbols-rounded">${isPlaying ? 'pause' : 'play_arrow'}</span>`;
+        centerBtn.innerHTML = `<span class="material-symbols-rounded">${isPlaying ? 'pause' : 'play_arrow'}</span>`;
+    };
+    const togglePlay = () => { if (video.paused || video.ended) video.play().catch(()=>{}); else video.pause(); };
+
+    btnPlay.addEventListener('click', togglePlay);
+    centerBtn.addEventListener('click', togglePlay);
+    video.addEventListener('click', togglePlay);
+
+    video.addEventListener('play', () => { setPlayIcon(true); wrap.classList.add('is-playing'); });
+    video.addEventListener('pause', () => { setPlayIcon(false); wrap.classList.remove('is-playing'); });
+    video.addEventListener('waiting', () => { spinner.style.display = 'flex'; });
+    video.addEventListener('playing', () => { spinner.style.display = 'none'; });
+    video.addEventListener('canplay', () => { spinner.style.display = 'none'; });
+
+    video.addEventListener('loadedmetadata', () => { timeDuration.innerText = formatVideoTime(video.duration); });
+    video.addEventListener('timeupdate', () => {
+        if (!video.duration) return;
+        const pct = (video.currentTime / video.duration) * 100;
+        seekPlayed.style.width = pct + '%';
+        seekHandle.style.left = pct + '%';
+        timeCurrent.innerText = formatVideoTime(video.currentTime);
+    });
+    video.addEventListener('progress', () => {
+        if (!video.duration || video.buffered.length === 0) return;
+        try {
+            const end = video.buffered.end(video.buffered.length - 1);
+            seekBuffered.style.width = Math.min(100, (end / video.duration) * 100) + '%';
+        } catch (e) {}
+    });
+    video.addEventListener('ended', () => { setPlayIcon(false); wrap.classList.remove('is-playing'); });
+
+    // --- Timeline: klik & geser (mouse + touch) untuk seek ---
+    let isScrubbing = false;
+    const seekToClientX = (clientX) => {
+        if (!video.duration) return;
+        const rect = seekWrap.getBoundingClientRect();
+        let ratio = (clientX - rect.left) / rect.width;
+        ratio = Math.max(0, Math.min(1, ratio));
+        video.currentTime = ratio * video.duration;
+        seekPlayed.style.width = (ratio * 100) + '%';
+        seekHandle.style.left = (ratio * 100) + '%';
+        timeCurrent.innerText = formatVideoTime(ratio * video.duration);
+    };
+    seekWrap.addEventListener('mousedown', (e) => { isScrubbing = true; seekToClientX(e.clientX); e.preventDefault(); });
+    seekWrap.addEventListener('touchstart', (e) => { isScrubbing = true; seekToClientX(e.touches[0].clientX); }, { passive: true });
+    window.addEventListener('mousemove', (e) => { if (isScrubbing) seekToClientX(e.clientX); });
+    window.addEventListener('touchmove', (e) => { if (isScrubbing) seekToClientX(e.touches[0].clientX); }, { passive: true });
+    window.addEventListener('mouseup', () => { isScrubbing = false; });
+    window.addEventListener('touchend', () => { isScrubbing = false; });
+
+    // --- Volume ---
+    btnMute.addEventListener('click', () => {
+        video.muted = !video.muted;
+        btnMute.innerHTML = `<span class="material-symbols-rounded">${video.muted || video.volume === 0 ? 'volume_off' : 'volume_up'}</span>`;
+        if (!video.muted && video.volume === 0) { video.volume = 1; volumeSlider.value = 1; }
+    });
+    volumeSlider.addEventListener('input', () => {
+        video.volume = parseFloat(volumeSlider.value);
+        video.muted = video.volume === 0;
+        btnMute.innerHTML = `<span class="material-symbols-rounded">${video.muted ? 'volume_off' : 'volume_up'}</span>`;
+    });
+
+    // --- Fullscreen ---
+    btnFullscreen.addEventListener('click', () => {
+        if (document.fullscreenElement) { document.exitFullscreen().catch(()=>{}); }
+        else if (wrap.requestFullscreen) { wrap.requestFullscreen().catch(()=>{}); }
+        else if (video.webkitEnterFullscreen) { video.webkitEnterFullscreen(); } // fallback iOS Safari
+    });
+
+    // --- Auto-hide control bar saat video sedang diputar & idle ---
+    let hideTimer = null;
+    const showControls = () => {
+        wrap.classList.add('show-controls');
+        clearTimeout(hideTimer);
+        if (!video.paused) hideTimer = setTimeout(() => wrap.classList.remove('show-controls'), 2800);
+    };
+    wrap.addEventListener('mousemove', showControls);
+    wrap.addEventListener('touchstart', showControls, { passive: true });
+    video.addEventListener('play', showControls);
+    showControls();
 }
 
 async function getOwnerFileBlob(fileId, onProgress, signal) {
@@ -4138,7 +4449,6 @@ function closePreviewModal() {
 function clearPreviewCache() {
     previewObjectUrls.forEach(u => { try { URL.revokeObjectURL(u); } catch(e) {} });
     previewObjectUrls.clear();
-    if (plyrPlayer) { try { plyrPlayer.destroy(); } catch(e) {} plyrPlayer = null; }
     const c = document.getElementById('preview-container'); if (c) c.innerHTML = '';
 }
 
