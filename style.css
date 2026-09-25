@@ -405,6 +405,36 @@ main { flex: 1; background: linear-gradient(180deg, rgba(209, 250, 229, 0.4) 0%,
 .preview-audio-wave { width:100%; height:90px; margin-bottom:14px; border-radius:12px; background:repeating-linear-gradient(90deg,rgba(255,255,255,.06) 0 3px,transparent 3px 8px); overflow:hidden; }
 .preview-progress { width:min(520px,90%); }
 
+/* ===== Custom Video Player (pengganti Plyr) ===== */
+.custom-video-player { position:relative; width:100%; max-height:calc(92vh - 100px); display:flex; align-items:center; justify-content:center; border-radius:10px; overflow:hidden; background:#000; }
+.custom-video-player video.preview-media { display:block; width:100%; max-height:calc(92vh - 100px); border-radius:0; cursor:pointer; }
+.video-center-btn { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); width:64px; height:64px; border-radius:50%; background:rgba(15,23,42,0.55); backdrop-filter:blur(2px); display:flex; align-items:center; justify-content:center; color:#fff; cursor:pointer; opacity:0; transition:opacity .2s, transform .15s; pointer-events:none; z-index:3; }
+.custom-video-player:not(.is-playing) .video-center-btn { opacity:1; pointer-events:auto; }
+.video-center-btn .material-symbols-rounded { font-size:34px; }
+.video-center-btn:active { transform:translate(-50%,-50%) scale(0.92); }
+.video-spinner { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; z-index:2; pointer-events:none; }
+.video-spinner .spinner { width:34px; height:34px; border:3px solid rgba(255,255,255,0.25); border-top-color:#34d399; border-radius:50%; animation:spin 0.8s linear infinite; }
+@keyframes spin { to { transform:rotate(360deg); } }
+.video-controls-bar { position:absolute; left:0; right:0; bottom:0; padding:10px 14px 12px; background:linear-gradient(to top, rgba(0,0,0,0.78), rgba(0,0,0,0)); opacity:0; transform:translateY(6px); transition:opacity .2s, transform .2s; z-index:4; }
+.custom-video-player.show-controls .video-controls-bar,
+.custom-video-player:not(.is-playing) .video-controls-bar { opacity:1; transform:translateY(0); }
+.video-seek-wrap { position:relative; width:100%; height:14px; display:flex; align-items:center; cursor:pointer; touch-action:none; }
+.video-seek-wrap::before { content:''; position:absolute; left:0; right:0; height:4px; border-radius:2px; background:rgba(255,255,255,0.25); }
+.video-seek-buffered { position:absolute; left:0; height:4px; border-radius:2px; background:rgba(255,255,255,0.4); width:0%; }
+.video-seek-played { position:absolute; left:0; height:4px; border-radius:2px; background:#34d399; width:0%; }
+.video-seek-handle { position:absolute; top:50%; width:12px; height:12px; border-radius:50%; background:#34d399; transform:translate(-50%,-50%); left:0%; box-shadow:0 0 0 3px rgba(52,211,153,0.25); }
+.video-controls-row { display:flex; align-items:center; gap:6px; margin-top:4px; }
+.video-ctrl-btn { background:transparent; border:0; color:#fff; width:32px; height:32px; display:flex; align-items:center; justify-content:center; border-radius:8px; cursor:pointer; flex-shrink:0; }
+.video-ctrl-btn:hover { background:rgba(255,255,255,0.12); }
+.video-ctrl-btn .material-symbols-rounded { font-size:22px; }
+.video-time { color:#e5e7eb; font-size:12px; font-family:monospace; flex-shrink:0; }
+.video-time-sep { color:#6b7280; font-size:12px; flex-shrink:0; }
+.video-ctrl-spacer { flex:1; }
+.video-volume-slider { width:70px; accent-color:#34d399; cursor:pointer; }
+@media (max-width: 520px) {
+    .video-volume-slider { width:46px; }
+}
+
 /* ===== PATCH: SECURITY (anti klik-kanan / anti-copy / anti-drag gambar) =====
    Catatan: ini hanya deterrent (mempersulit user awam), bukan proteksi mutlak.
    Tidak mengubah logic aplikasi apapun. */
