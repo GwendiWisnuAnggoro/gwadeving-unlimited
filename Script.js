@@ -2516,10 +2516,23 @@ function uploadChunkXHR(formData, startBytes, totalFileSize, onProgress) {
         xhr.onload = () => { 
             clearInterval(fallbackTimer);
             currentActiveXhr = null; 
-            if (xhr.status !== 200) return reject(new Error('HTTP ' + xhr.status)); 
+            // FIX: sebelumnya kalau gagal cuma dilempar "HTTP 400" doang -- gak
+            // kelihatan ALASAN aslinya (Telegram/Cloudflare biasanya balikin body
+            // JSON berisi description yang jelas, mis. "Bad Request: file must be
+            // non-empty" atau semacamnya). Sekarang badan responsnya ikut dibaca
+            // dan ditampilkan, biar pesan errornya kelihatan penyebab pastinya --
+            // bukan cuma kode status doang.
+            if (xhr.status !== 200) {
+                let detail = '';
+                try {
+                    const errJson = JSON.parse(xhr.responseText);
+                    detail = errJson.description || errJson.error || (typeof errJson === 'string' ? errJson : '');
+                } catch (e) { detail = (xhr.responseText || '').slice(0, 200); }
+                return reject(new Error('HTTP ' + xhr.status + (detail ? (': ' + detail) : '')));
+            }
             try { 
                 const json = JSON.parse(xhr.responseText); 
-                if (!json.ok) return reject(new Error('Error Telegram')); 
+                if (!json.ok) return reject(new Error('Error Telegram: ' + (json.description || JSON.stringify(json)).toString().slice(0,200))); 
                 emit(chunkSize); // pastikan chunk ini genap 100% begitu server konfirmasi sukses
                 resolve(json); 
             } catch (e) { reject(e); } 
@@ -4923,7 +4936,17 @@ async function getSharedDataFromSheets(shareCode, viewerUid, subPath = null) {
 
         if (raw && raw.sharesRows && raw.sharesRows.length > 0) {
             const shareRow = raw.sharesRows.find(r => String(r[0] || '').trim() === String(shareCode || '').trim());
-            if (!shareRow) return { success: false, deleted: true };
+            if (!shareRow) {
+                // FIX BUG "404 PALSU SAAT RENAME": dulu begitu gviz gak nemu baris
+                // share-nya, LANGSUNG divonis "link tidak valid/dihapus" dan
+                // ditampilkan ke viewer manapun yang lagi buka -- padahal ini
+                // sering cuma race gviz yang belum sinkron pas pemilik baru saja
+                // rename folder/ubah privasi (linknya sendiri sebenarnya masih
+                // ada). Sekarang sebelum divonis hilang, dikonfirmasi dulu lewat
+                // GAS (selalu baca live, gak ada cache) -- baru kalau GAS JUGA
+                // bilang gak ada, baru itu beneran dianggap hilang.
+                return await callGasAPIFetch('resolve_share', { shareId: shareCode, viewerUid: viewerUid, subPath: subPath });
+            }
 
             const itemId = String(shareRow[1] || '').trim();
             const itemType = String(shareRow[2] || '').trim().toLowerCase();
@@ -4945,6 +4968,16 @@ async function getSharedDataFromSheets(shareCode, viewerUid, subPath = null) {
             }
 
             if (!activeItemRow) {
+                // FIX BUG "404 PALSU SAAT RENAME" (lanjutan): sama seperti di atas --
+                // ini titik yang PERSIS memicu gambar "404 -- Tidak Ditemukan" yang
+                // kamu lihat pas rename folder. itemId di baris share masih pakai
+                // path LAMA sesaat, sementara folderRows dari gviz mungkin baru
+                // separuh ter-update (race), jadi kelihatan "gak ketemu" padahal
+                // linknya utuh. Konfirmasi dulu ke GAS sebelum vonis dihapus.
+                const liveConfirm = await callGasAPIFetch('resolve_share', { shareId: shareCode, viewerUid: viewerUid, subPath: subPath });
+                if (liveConfirm && liveConfirm.success) return liveConfirm; // ternyata masih ada -- gviz-nya doang yang basi
+
+                // GAS juga bilang gak ada -- baru di sini beneran dianggap hilang.
                 // Item tidak ada lagi di data aktif -- cek dulu apakah masih ada
                 // di Sampah (baru ditrash) atau sudah benar-benar hilang (dihapus
                 // permanen), supaya pemiliknya bisa diarahkan dengan tepat.
