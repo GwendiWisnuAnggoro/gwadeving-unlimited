@@ -86,9 +86,52 @@ function showToast(message, isError = false) {
     if (isError) { toast.classList.add('error'); toast.classList.remove('success'); icon.innerText = 'error'; }
     else { toast.classList.remove('error'); toast.classList.add('success'); icon.innerText = 'check_circle'; }
 
+    // PATCH: tombol Copy khusus toast error -- biar pesan error lengkap
+    // (yang sering kepotong secara visual) bisa disalin persis tanpa perlu
+    // buka DevTools/inspect. Dibuat sekali lalu dipakai ulang tiap toast.
+    let copyBtn = document.getElementById('toast-copy-btn');
+    if (isError) {
+        if (!copyBtn) {
+            copyBtn = document.createElement('button');
+            copyBtn.id = 'toast-copy-btn';
+            copyBtn.type = 'button';
+            copyBtn.innerText = 'Copy';
+            copyBtn.style.cssText = 'margin-left:10px;padding:4px 10px;font-size:12px;line-height:1.2;border:1px solid currentColor;border-radius:6px;background:transparent;color:inherit;cursor:pointer;flex-shrink:0;opacity:0.9;';
+            toast.appendChild(copyBtn);
+        }
+        copyBtn.style.display = 'inline-block';
+        copyBtn.innerText = 'Copy';
+        copyBtn.onclick = async (e) => {
+            e.stopPropagation();
+            const textToCopy = document.getElementById('toast-message').innerText;
+            try {
+                if (navigator.clipboard && window.isSecureContext) {
+                    await navigator.clipboard.writeText(textToCopy);
+                } else {
+                    // Fallback kalau Clipboard API tidak tersedia (mis. konteks non-HTTPS)
+                    const ta = document.createElement('textarea');
+                    ta.value = textToCopy;
+                    ta.style.position = 'fixed'; ta.style.opacity = '0';
+                    document.body.appendChild(ta);
+                    ta.focus(); ta.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(ta);
+                }
+                copyBtn.innerText = 'Tersalin!';
+            } catch (err) {
+                copyBtn.innerText = 'Gagal copy';
+            } finally {
+                setTimeout(() => { if (copyBtn) copyBtn.innerText = 'Copy'; }, 1500);
+            }
+        };
+    } else if (copyBtn) {
+        copyBtn.style.display = 'none';
+    }
+
     toast.classList.add('show');
     clearTimeout(toastTimeout);
-    toastTimeout = setTimeout(() => { toast.classList.remove('show'); }, 3500);
+    // Toast error dikasih waktu lebih lama supaya sempat ditekan tombol Copy-nya
+    toastTimeout = setTimeout(() => { toast.classList.remove('show'); }, isError ? 8000 : 3500);
 }
 
 // ==========================================
