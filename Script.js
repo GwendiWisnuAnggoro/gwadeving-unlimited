@@ -4023,7 +4023,7 @@ async function drawAudioWave(container, audioUrl) {
             <div id="waveform-container" style="position: relative; width: 100%; height: 130px; background-color: #232332; border-radius: 12px; overflow: hidden; cursor: not-allowed; border: 1px solid rgba(255,255,255,0.05); touch-action: none;">
                 
                 <div id="wave-loading" style="position: absolute; inset: 0; display: flex; justify-content: center; align-items: center; color: #888; font-size: 13px; z-index: 20;">
-                    <span class="spinner" style="width: 14px; height: 14px; border-width: 2px; border-top-color: #34d399; margin-right: 8px;"></span> Menyiapkan audio...
+                    <span class="spinner" style="width: 14px; height: 14px; border-width: 2px; border-top-color: #34d399; margin-right: 8px;"></span> Menyiapkan grafik audio...
                 </div>
 
                 <div id="wave-gradient" style="position: absolute; top: 0; left: 0; height: 100%; width: 0%; background: linear-gradient(90deg, rgba(52, 211, 153, 0.4) 0%, rgba(52, 211, 153, 0.05) 100%); z-index: 1;"></div>
@@ -4107,6 +4107,19 @@ async function drawAudioWave(container, audioUrl) {
 
     audio.onloadedmetadata = () => {
         timeTotal.innerText = formatTime(audio.duration);
+        // FIX: dulu Play/RW/FF dikunci sampai SELURUH file audio selesai
+        // di-fetch penuh + didekode (cuma buat gambar waveform) -- padahal
+        // <audio> ini sendiri sudah streaming lewat worker (Range request),
+        // jadi bisa mulai main jauh lebih cepat. Sekarang begitu metadata
+        // siap (butuh sedikit data awal doang), playback langsung dibuka;
+        // waveform-nya nyusul digambar di background tanpa ngunci apa pun.
+        if (!isWaveformReady) {
+            isWaveformReady = true;
+            waveContainer.style.cursor = 'pointer';
+            btnPlay.disabled = false; btnPlay.style.opacity = '1'; btnPlay.style.cursor = 'pointer';
+            btnRw.disabled = false; btnRw.style.opacity = '1'; btnRw.style.cursor = 'pointer';
+            btnFf.disabled = false; btnFf.style.opacity = '1'; btnFf.style.cursor = 'pointer';
+        }
     };
 
     const updatePositionFromEvent = (clientX) => {
