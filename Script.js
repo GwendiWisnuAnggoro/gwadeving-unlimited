@@ -3372,7 +3372,19 @@ function startSharedPolling(code) {
     
     sharedPollTimer = setInterval(async () => {
         if (pendingShareCode !== code || document.getElementById('shared-view').style.display === 'none') { stopSharedPolling(); return; }
-        
+
+        // FIX BUG "PROSES UPLOAD DIBATALKAN TERUS": polling realtime ini jalan
+        // tiap 1 detik dan sebelumnya BISA memutus proses upload yang sedang
+        // berjalan di folder yang sama -- setiap kali hasil resolve_share
+        // "kelihatan" gagal/tidak authorized (termasuk cuma karena hiccup
+        // sesaat pembacaan gviz saat trafik upload lagi tinggi), tick ini
+        // langsung stopSharedPolling() + abort(globalAbortController) +
+        // renderShare404()/renderSharedAuthWall(), padahal itemnya baik-baik
+        // saja. Sekarang selama upload ke folder share ini masih berjalan,
+        // tick realtime dilewati dulu (bukan dimatikan -- cuma ditunda),
+        // supaya proses upload tidak pernah diinterupsi di tengah jalan.
+        if (isUploadInProgress && sharedUploadActive) return;
+
         const res = await getSharedDataFromSheets(code, sharedViewerUid, sharedCurrentPath);
         
         // JIKA FILE DIHAPUS / PINDAH KE SAMPAH
