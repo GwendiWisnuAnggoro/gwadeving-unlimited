@@ -5407,6 +5407,25 @@ async function getSharedDataFromSheets(shareCode, viewerUid, subPath = null, for
                 }
             }
 
+            // FIX BUG "ISI FOLDER HILANG SAAT RENAME": root foldernya sendiri
+            // sudah dipastikan ADA di pengecekan activeItemRow di atas, tapi
+            // daftar ISI-nya (subfolder & file) di sini dibangun dari sheet
+            // DB_01 yang dibaca gviz SECARA TERPISAH dari DB_03/DB_05 (yang
+            // dipakai memastikan root-nya tadi). Kalau snapshot gviz DB_01
+            // kebetulan lebih basi/telat ter-update dibanding DB_03/DB_05
+            // (race antar-sheet, sering kejadian tepat setelah rename folder),
+            // kolom folder di baris-baris file itu masih path LAMA sesaat --
+            // jadi tidak ada satu pun yang cocok dengan currentBrowsePath yang
+            // sudah baru, dan folder kelihatan KOSONG padahal isinya utuh di
+            // server. Sama seperti pengecekan root di atas: kalau isinya
+            // kelihatan kosong, konfirmasi SEKALI ke GAS (live, tanpa cache)
+            // dulu sebelum ditampilkan sebagai folder kosong ke viewer.
+            if (contents.subfolders.length === 0 && contents.files.length === 0) {
+                const liveConfirmEmpty = await callGasAPIFetch('resolve_share', { shareId: shareCode, viewerUid: viewerUid, subPath: subPath });
+                if (liveConfirmEmpty && liveConfirmEmpty.success) return liveConfirmEmpty;
+                // GAS juga bilang kosong/gagal -- berarti memang beneran kosong, pakai hasil gviz apa adanya.
+            }
+
             return {
                 success: true,
                 authorized: true,
