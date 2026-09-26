@@ -3096,6 +3096,21 @@ function renderSharedWithMeSidebar() {
 
 function getViewerAccountForOwner(ownerId) { return accountsList.find(a => a.ownerId === ownerId) || null; }
 
+// Login/auth SUNGGUHAN ke akun pemilik (bukan cuma nge-fake viewerUid) --
+// sesi akun aktif betul-betul dipindah ke akun pemilik ini, dengan syarat
+// akunnya memang sudah tersimpan/login di perangkat ini sebelumnya.
+async function authenticateToOwnerAccount(ownerAccount) {
+    try {
+        const verify = await callGasAPI('verify_account', { ownerId: ownerAccount.ownerId });
+        if (!verify || (!verify.success && !verify.networkError)) return false;
+    } catch (e) { return false; }
+    accountsList = accountsList.filter(a => a.user !== ownerAccount.user);
+    accountsList.unshift(ownerAccount);
+    setActiveAccount(ownerAccount);
+    saveAccountsToStorage();
+    return true;
+}
+
 async function handleSharedLink(code) {
     pendingShareCode = code;
     sharedSelectedIds.clear(); sharedIsSelecting = false;
@@ -3111,13 +3126,72 @@ async function handleSharedLink(code) {
     sharedViewerUid = activeAcc ? activeAcc.ownerId : '';
     sharedIsOwnerView = false;
 
-    const res = await getSharedDataFromSheets(code, sharedViewerUid);
+    let res = await getSharedDataFromSheets(code, sharedViewerUid);
     pendingShareResolved = res;
 
-    if (!res || !res.success || res.deleted) { stopSharedPolling(); renderShare404(); updateSharedViewChrome(); return; }
+    if (!res) { stopSharedPolling(); renderShare404(); updateSharedViewChrome(); return; }
 
-    /* IMPORTANT: even if the viewer is the owner, a share URL stays inside the
-       shared viewer. Never redirect to the owner's Drive from a share URL. */
+    // Item sudah dihapus/masuk sampah. Kalau kebetulan pemiliknya sendiri yang
+    // buka link ini dan akunnya ada di perangkat ini, LOGIN BENERAN dulu ke
+    // akun itu (kalau belum aktif), baru arahkan ke tempat yang tepat.
+    if (res.deleted) {
+        const ownerAccount = res.ownerId ? getViewerAccountForOwner(res.ownerId) : null;
+        if (ownerAccount) {
+            let ok = true;
+            if (sharedViewerUid !== ownerAccount.ownerId) {
+                showLoadingOverlay(`Masuk ke akun ${ownerAccount.user}...`, false, false);
+                ok = await authenticateToOwnerAccount(ownerAccount);
+                hideLoadingOverlay();
+            }
+            if (ok) {
+                if (res.inTrash) { await redirectOwnerToTrash(ownerAccount, res); return; }
+                await redirectOwnerToDeletedError(ownerAccount, res); return;
+            }
+        }
+        stopSharedPolling(); renderShare404(); updateSharedViewChrome(); return;
+    }
+
+    if (!res.success) { stopSharedPolling(); renderShare404(); updateSharedViewChrome(); return; }
+
+    // Belum diotorisasi (privasi private/restricted, dan akun yang sedang
+    // aktif bukan pemiliknya). Cek dulu apakah pemiliknya punya akun di
+    // perangkat ini -- kalau ada, LOGIN BENERAN ke akun itu (bukan nge-fake
+    // identitas viewer), baru ambil ulang datanya pakai sesi akun yang
+    // sebenarnya sudah berpindah.
+    if (!res.authorized) {
+        const ownerAccount = res.ownerId ? getViewerAccountForOwner(res.ownerId) : null;
+        if (ownerAccount) {
+            showLoadingOverlay(`Masuk ke akun ${ownerAccount.user}...`, false, false);
+            const switched = await authenticateToOwnerAccount(ownerAccount);
+            hideLoadingOverlay();
+            if (switched) {
+                sharedViewerUid = ownerAccount.ownerId;
+                res = await getSharedDataFromSheets(code, sharedViewerUid);
+                pendingShareResolved = res;
+            }
+        }
+        if (!res || !res.success) {
+            if (res && res.deleted) { stopSharedPolling(); renderShare404(); updateSharedViewChrome(); return; }
+            renderSharedAuthWall(res); startSharedPolling(code); return;
+        }
+    }
+
+    // Kalau ownernya sendiri yang buka link ini (baik sudah aktif dari awal,
+    // atau baru saja berhasil di-login-kan otomatis di atas), langsung
+    // alihkan ke Drive miliknya sendiri -- gak perlu lewat tampilan "shared".
+    // Untuk folder langsung dibuka foldernya, untuk file langsung dicariin
+    // lewat kolom cari.
+    const ownerAccount = getViewerAccountForOwner(res.ownerId);
+    if (ownerAccount) {
+        let ok = true;
+        if (sharedViewerUid !== ownerAccount.ownerId) {
+            showLoadingOverlay(`Masuk ke akun ${ownerAccount.user}...`, false, false);
+            ok = await authenticateToOwnerAccount(ownerAccount);
+            hideLoadingOverlay();
+        }
+        if (ok) { await redirectOwnerToDrive(ownerAccount, res); return; }
+    }
+
     sharedRootItem = { path: res.item.path || '', name: res.item.name, itemType: res.itemType, ownerId: res.ownerId };
     sharedCurrentPath = res.item.path || '';
     updateSharedViewChrome();
@@ -3140,11 +3214,8 @@ async function redirectOwnerToDrive(ownerAccount, res) {
     pendingShareCode = null; 
     pendingShareResolved = null; 
 
-    accountsList = accountsList.filter(a => a.user !== ownerAccount.user);
-    accountsList.unshift(ownerAccount);
-    saveAccountsToStorage();
-    currentUser = ownerAccount.user; currentOwnerId = ownerAccount.ownerId;
-
+    // Akun aktif sudah beneran dipindah ke akun pemilik oleh
+    // authenticateToOwnerAccount() sebelum fungsi ini dipanggil.
     document.getElementById('shared-view').style.display = 'none';
     document.getElementById('login-view').style.display = 'none';
     document.getElementById('app-layout').style.display = 'flex';
@@ -3167,6 +3238,61 @@ async function redirectOwnerToDrive(ownerAccount, res) {
         if (searchInput) { searchInput.value = res.item.name; filterFiles(); }
         showToast(`Ini adalah berkas Anda sendiri ("${displayName}") — dialihkan ke Drive Anda.`, false);
     }
+}
+
+// Item ternyata masih ada di Sampah pemiliknya sendiri -- langsung buka tab
+// Sampah dan cari itemnya di sana (bukan cuma dikasih 404).
+async function redirectOwnerToTrash(ownerAccount, res) {
+    stopSharedPolling();
+    pendingShareCode = null;
+    pendingShareResolved = null;
+
+    // Akun aktif sudah beneran dipindah ke akun pemilik oleh
+    // authenticateToOwnerAccount() sebelum fungsi ini dipanggil.
+    document.getElementById('shared-view').style.display = 'none';
+    document.getElementById('login-view').style.display = 'none';
+    document.getElementById('app-layout').style.display = 'flex';
+
+    window.history.replaceState({}, document.title, location.origin + location.pathname);
+
+    showLoadingOverlay("Membuka Sampah Anda...", false, false);
+    await syncData();
+    startSharedWithMePolling();
+    hideLoadingOverlay();
+
+    currentTab = 'trash';
+    const searchInput = document.getElementById('search-input');
+    let displayName = '';
+    if (res.item && res.item.name) {
+        displayName = res.item.name + (res.item.format && res.item.format !== 'sys_folder' ? '.' + res.item.format : '');
+        if (searchInput) searchInput.value = res.item.name;
+    }
+    renderUI();
+    showToast(displayName ? `Item ini ("${displayName}") ada di Sampah Anda.` : "Item ini ada di Sampah Anda.", false);
+}
+
+// Item sudah dihapus permanen (tidak ada di aktif maupun Sampah) -- kasih
+// tahu pemiliknya lewat error toast, tetap dialihkan ke Drive-nya sendiri.
+async function redirectOwnerToDeletedError(ownerAccount, res) {
+    stopSharedPolling();
+    pendingShareCode = null;
+    pendingShareResolved = null;
+
+    // Akun aktif sudah beneran dipindah ke akun pemilik oleh
+    // authenticateToOwnerAccount() sebelum fungsi ini dipanggil.
+    document.getElementById('shared-view').style.display = 'none';
+    document.getElementById('login-view').style.display = 'none';
+    document.getElementById('app-layout').style.display = 'flex';
+
+    window.history.replaceState({}, document.title, location.origin + location.pathname);
+
+    showLoadingOverlay("Membuka Drive Anda...", false, false);
+    await syncData();
+    startSharedWithMePolling();
+    hideLoadingOverlay();
+
+    navigateToFolder('');
+    showToast(res.itemType === 'folder' ? "Folder ini sudah dihapus permanen." : "Berkas ini sudah dihapus permanen.", true);
 }
 
 function updateSharedViewChrome() {
@@ -4645,12 +4771,25 @@ async function getSharedDataFromSheets(shareCode, viewerUid, subPath = null) {
             let activeItemRow = null;
             if (itemType === 'file') {
                 activeItemRow = raw.sheet1Rows.find(r => String(r[0] || '').trim() === itemId && String(r[8] || '').trim() === ownerId);
-                // Jika tidak ditemukan di file aktif, berarti sudah dihapus/disampah
-                if (!activeItemRow) return { success: false, deleted: true }; 
             } else if (itemType === 'folder') {
                 activeItemRow = raw.folderRows.find(r => String(r[0] || '').trim() === itemId && String(r[1] || '').trim() === ownerId);
-                // Jika tidak ditemukan di folder aktif, berarti sudah dihapus/disampah
-                if (!activeItemRow) return { success: false, deleted: true };
+            }
+
+            if (!activeItemRow) {
+                // Item tidak ada lagi di data aktif -- cek dulu apakah masih ada
+                // di Sampah (baru ditrash) atau sudah benar-benar hilang (dihapus
+                // permanen), supaya pemiliknya bisa diarahkan dengan tepat.
+                let trashItemRow = null;
+                if (itemType === 'file') {
+                    trashItemRow = raw.trashRows.find(r => String(r[0] || '').trim() === itemId && String(r[9] || '').trim() === ownerId);
+                } else if (itemType === 'folder') {
+                    trashItemRow = raw.trashRows.find(r => String(r[0] || '').trim() === itemId && String(r[3] || '').trim() === 'sys_folder' && String(r[9] || '').trim() === ownerId);
+                }
+                return {
+                    success: false, deleted: true, ownerId, ownerName, itemType,
+                    inTrash: !!trashItemRow,
+                    item: trashItemRow ? { id: trashItemRow[0], name: trashItemRow[1], format: trashItemRow[3], folder: trashItemRow[4] } : null
+                };
             }
 
             let authorized = true;
