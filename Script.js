@@ -195,6 +195,9 @@ let pendingShareCode = null;
 let pendingShareResolved = null;
 let sharedViewerUid = '';
 let sharedIsOwnerView = false;
+// Peran (view/edit) untuk share tipe FILE tunggal (bukan folder) -- dipakai
+// untuk menampilkan tombol "Ganti Nama" di halaman file yang dibagikan.
+let sharedFileShareRole = 'view';
 let sharedRootItem = null;
 let sharedCurrentPath = '';
 let sharedPollTimer = null;
@@ -3239,20 +3242,14 @@ async function handleSharedLink(code) {
     sharedIsOwnerView = false;
 
     // FIX: pemuatan PERTAMA kali link share dibuka juga bisa kena race gviz
-    // yang sama seperti di polling (lihat catatan panjang di startSharedPolling
-    // di atas) -- misalnya link dibuka persis beberapa detik setelah pemiliknya
-    // rename folder/ubah privasi di HP lain. Beda dengan polling (yang jalan
-    // terus tiap detik dan sudah punya toleransi sendiri), ini cuma 1x
-    // kesempatan -- jadi dikasih retry singkat dulu di sini sebelum benar2
-    // dianggap gagal, supaya "loading pertama" gak langsung nyasar ke 404.
+    // yang sama seperti di polling (lihat catatan di startSharedPolling) --
+    // misalnya link dibuka persis sesaat setelah pemiliknya rename folder/ubah
+    // privasi di HP lain. Sama seperti di polling: kalau gviz kelihatan gagal,
+    // konfirmasi SEKALI ke GAS (live, gak ada cache) -- bukan retry/nunggu
+    // berkali-kali, karena itu cuma menunda tanpa menjamin datanya jadi benar.
     let res = await getSharedDataFromSheets(code, sharedViewerUid);
-    // Retry HANYA kalau hasilnya gagal TOTAL (null atau res.success falsy --
-    // termasuk res.deleted:true, yang paling sering kena race gviz). Kalau
-    // res.success === true tapi res.authorized === false, itu kasus VALID
-    // (privacy private/restricted beneran) -- jangan di-retry, langsung proses.
-    for (let retry = 0; retry < 3 && (!res || !res.success); retry++) {
-        await sleep(700 * (retry + 1));
-        res = await getSharedDataFromSheets(code, sharedViewerUid);
+    if (!res || !res.success) {
+        res = await getSharedDataFromSheets(code, sharedViewerUid, null, true);
     }
     pendingShareResolved = res;
 
@@ -3392,8 +3389,13 @@ async function redirectOwnerToDrive(ownerAccount, res) {
         const folderPath = (res.item.folder && res.item.folder !== "#*null*#") ? res.item.folder : '';
         navigateToFolder(folderPath);
         let displayName = res.item.name + (res.item.format ? '.' + res.item.format : '');
-        const searchInput = document.getElementById('search-input');
-        if (searchInput) { searchInput.value = res.item.name; filterFiles(); }
+        // FIX: dulu file yang dituju dicari/disorot lewat SEARCH BOX
+        // berdasarkan NAMA -- kalau ada beberapa file dengan nama sama di
+        // folder itu, hasilnya ambigu (bisa nyorot file yang salah). Sekarang
+        // langsung dibuka lewat fileId-nya (unik per file), jadi yang tampil
+        // dijamin persis file yang link-nya dibuka, apa pun namanya.
+        const exactFile = stateArray.active.find(f => f.id === res.item.id);
+        if (exactFile) previewFile(exactFile.id, exactFile.format, displayName);
         showToast(`Ini adalah berkas Anda sendiri ("${displayName}") — dialihkan ke Drive Anda.`, false);
     }
 }
@@ -3493,27 +3495,31 @@ function hideSharedUploadFab() {
     if (fab) fab.style.display = 'none';
 }
 
-// FIX BUG "404 PALSU SAAT RENAME/UBAH DATA" (lanjutan dari getSharedDataFromSheets):
-// gviz (Google Sheets) punya cache internal di sisi Google yang bisa basi sampai
-// puluhan detik SETELAH ada tulisan baru (rename folder, ubah privasi, dst), dan
-// beberapa sheet (DB_03/DB_05/DB_01) dibaca lewat request gviz TERPISAH yang
-// masing-masing punya cache sendiri-sendiri -- jadi ada window waktu singkat di
-// mana kombinasi datanya "kelihatan" tidak konsisten (row share ada tapi row
-// foldernya belum ke-update, dst) walau linknya sendiri sebenarnya valid.
-// Sebelumnya: 1x tick polling dapat hasil "gagal/dihapus/tidak authorized" ->
-// LANGSUNG stopSharedPolling() + tampilkan 404/auth-wall permanen, padahal
-// itu cuma race gviz sesaat -- makanya di gambar sebelumnya user harus
-// refresh manual biar datanya balik normal. Sekarang: dibutuhkan beberapa
-// kali GAGAL BERTURUT-TURUT dulu (SHARED_FAIL_THRESHOLD tick, @1 detik/tick)
-// sebelum benar-benar divonis 404/tidak authorized -- kalau di antaranya ada
-// 1x sukses, hitungannya direset ke 0 lagi.
-let sharedPollFailStreak = 0;
-const SHARED_FAIL_THRESHOLD = 5; // ~5 detik gagal beruntun -- di atas rentang wajar lag cache gviz
+// FIX BUG "404 PALSU / DATA BASI SAAT RENAME": gviz (Google Sheets) punya cache
+// internal di sisi Google yang bisa basi sampai puluhan detik SETELAH ada
+// tulisan baru (rename folder, ubah privasi, dst). ADA 2 GEJALA berbeda dari
+// staleness ini, dan dua-duanya ditangani di sini:
+//  1) "Gagal palsu" -- gviz sesaat gak nemu baris share/foldernya (padahal
+//     linknya valid) -> dulu langsung divonis 404 di tick itu juga.
+//  2) "Sukses tapi basi" -- gviz TETAP berhasil balikin data, tapi datanya
+//     masih snapshot LAMA (nama folder lama, dst) -- ini TIDAK pernah masuk
+//     jalur error sama sekali, jadi sebelumnya gak ada yang mengoreksinya;
+//     ditunggu berapa lama pun kalau gviz kebetulan tetap konsisten
+//     menyajikan snapshot lama, datanya gak akan pernah berubah sendiri.
+// Solusinya BUKAN "tunggu N kali gagal dulu baru boleh dipercaya" (itu cuma
+// menunda gejala #1 dan sama sekali gak menyentuh gejala #2). Solusinya:
+// begitu gviz kelihatan gagal, LANGSUNG konfirmasi SEKALI ke GAS (baca
+// Spreadsheet live, bukan cache) -- bukan nunggu/coba-coba ulang berkali2.
+// Dan supaya gejala #2 juga ketangkep, tiap beberapa detik dipaksa 1x baca
+// live ke GAS juga WALAU tick sebelumnya "sukses" -- ini yang bikin rename
+// beneran ke-refresh dalam hitungan detik, bukan nunggu cache gviz habis
+// sendiri (yang kadang gak pernah habis-habis kalau nasib snapshotnya apes).
+const SHARED_FORCE_LIVE_EVERY_TICKS = 4; // paksa baca live tiap ~4 detik, terlepas dari sukses/gagalnya gviz
 
 function startSharedPolling(code) {
     stopSharedPolling();
     sharedDataSignature = null;
-    sharedPollFailStreak = 0;
+    let tickCount = 0;
     
     sharedPollTimer = setInterval(async () => {
         if (pendingShareCode !== code || document.getElementById('shared-view').style.display === 'none') { stopSharedPolling(); return; }
@@ -3530,12 +3536,25 @@ function startSharedPolling(code) {
         // supaya proses upload tidak pernah diinterupsi di tengah jalan.
         if (isUploadInProgress && sharedUploadActive) return;
 
-        const res = await getSharedDataFromSheets(code, sharedViewerUid, sharedCurrentPath);
+        tickCount++;
+        // Setiap beberapa tick, paksa lewati gviz sama sekali dan baca
+        // langsung dari GAS -- ini yang menangkap kasus "sukses tapi basi"
+        // (gejala #2 di atas) yang gak pernah ketahuan dari sisi gagal/sukses.
+        const forceLive = (tickCount % SHARED_FORCE_LIVE_EVERY_TICKS === 0);
+
+        let res = await getSharedDataFromSheets(code, sharedViewerUid, sharedCurrentPath, forceLive);
         
-        // JIKA FILE DIHAPUS / PINDAH KE SAMPAH
+        // Kalau gviz (bukan forceLive) kelihatan gagal/dihapus/tidak authorized,
+        // JANGAN langsung divonis -- konfirmasi SEKALI SAJA ke sumber live (GAS)
+        // sebelum dipercaya. Bukan retry berkali-kali/nunggu beberapa detik --
+        // cukup 1x cek ke sumber yang gak ada cache-nya sama sekali, hasilnya
+        // langsung final (dipakai apa adanya, sukses maupun gagal).
+        if (!forceLive && (!res || !res.success || res.deleted || !res.authorized)) {
+            res = await getSharedDataFromSheets(code, sharedViewerUid, sharedCurrentPath, true);
+        }
+        
+        // JIKA FILE DIHAPUS / PINDAH KE SAMPAH (sudah dikonfirmasi live, final)
         if (!res || !res.success || res.deleted) { 
-            sharedPollFailStreak++;
-            if (sharedPollFailStreak < SHARED_FAIL_THRESHOLD) return; // masih mungkin race gviz -- coba lagi tick berikutnya, jangan langsung vonis
             stopSharedPolling(); 
             closePreviewModal(); 
             hideSharedUploadFab();
@@ -3553,13 +3572,9 @@ function startSharedPolling(code) {
             return; 
         }
         
-        // JIKA HAK AKSES DICABUT / DIBATASI (berlaku untuk SEMUA jenis privasi,
-        // bukan cuma 'restricted' -- privacy 'private' juga bisa authorized:false
-        // di tengah jalan kalau pemilik mengubah pengaturan berbagi saat viewer
-        // masih membuka halamannya).
+        // JIKA HAK AKSES DICABUT / DIBATASI (sudah dikonfirmasi live, final --
+        // berlaku untuk SEMUA jenis privasi, bukan cuma 'restricted').
         if (!res.authorized) { 
-            sharedPollFailStreak++;
-            if (sharedPollFailStreak < SHARED_FAIL_THRESHOLD) return; // sama -- beri toleransi lag gviz dulu
             stopSharedPolling(); 
             closePreviewModal(); 
             hideSharedUploadFab();
@@ -3577,7 +3592,6 @@ function startSharedPolling(code) {
             return; 
         }
 
-        sharedPollFailStreak = 0; // sukses -> reset hitungan gagal beruntun
         pendingShareResolved = Object.assign({}, pendingShareResolved, res);
 
         // Update peran (view/edit) tiap detik walau isi folder tidak berubah,
@@ -3677,7 +3691,12 @@ function renderSharedBreadcrumb(res, subPath) {
 }
 async function navigateSharedTo(path) {
     showLoadingOverlay("Membuka folder...", false, false);
-    const r = await getSharedDataFromSheets(pendingShareCode, sharedViewerUid, path);
+    let r = await getSharedDataFromSheets(pendingShareCode, sharedViewerUid, path);
+    if (!r || !r.success || !r.authorized) {
+        // Sama seperti di startSharedPolling/handleSharedLink -- 1x konfirmasi
+        // live ke GAS sebelum divonis gagal, bukan cuma percaya gviz mentah2.
+        r = await getSharedDataFromSheets(pendingShareCode, sharedViewerUid, path, true);
+    }
     hideLoadingOverlay();
     if (r && r.success && r.authorized) renderSharedFolderBody({ ownerId: pendingShareResolved.ownerId, ownerName: pendingShareResolved.ownerName, itemType: 'folder', item: r.item }, pendingShareCode, sharedViewerUid, path);
     else if (r && (!r.success || !r.authorized)) { renderShare404(); }
@@ -3695,16 +3714,26 @@ async function getSharedFileChunks(fileId, ownerId, shareId, viewerUid) {
 
 async function renderSharedFileBody(res, shareId, viewerUid) {
     hideSharedUploadFab();
+    // FIX: peran (view/edit) share tipe FILE tunggal dicatat di sini supaya
+    // tombol "Ganti Nama" cuma tampil kalau viewer memang diberi akses edit.
+    sharedFileShareRole = res.role === 'edit' ? 'edit' : 'view';
     const item = res.item;
     let displayName = item.name + (item.format ? '.' + item.format : '');
     renderSharedBreadcrumb(res, '');
     const body = document.getElementById('shared-body');
+    const safeDisplayName = displayName.replace(/'/g, "\\'");
+    const renameBtnHTML = sharedFileShareRole === 'edit'
+        ? `<button class="icon-btn" style="margin-top:16px;" onclick="sharedRenameStandaloneFile('${item.id}','${escapeHtml(item.name).replace(/'/g, "\\'")}','${shareId}','${viewerUid}')" title="Ganti Nama"><span class="material-symbols-rounded">edit</span></button>`
+        : '';
     body.innerHTML = `
         <div style="max-width:700px; margin:0 auto; background:#fff; border-radius:var(--radius-lg); padding:24px; box-shadow:var(--shadow-card);">
             <h2 style="font-size:18px; font-weight:800; margin-bottom:4px; word-break:break-all;">${displayName}</h2>
             <p style="font-size:12.5px; color:var(--text-muted); margin-bottom:18px;">${formatBytes(item.size)}</p>
             <div id="shared-preview-container" style="min-height:280px; background:#0f172a; border-radius:var(--radius-md); display:flex; align-items:center; justify-content:center; overflow:auto;"></div>
-            <button class="btn-primary" style="margin-top:16px;" onclick="downloadSharedFile('${item.id}','${item.format || ''}','${displayName.replace(/'/g, "\\'")}','${shareId}','${viewerUid}')"><span class="material-symbols-rounded">download</span> Unduh Berkas</button>
+            <div style="display:flex; align-items:center; gap:10px;">
+                <button class="btn-primary" style="margin-top:16px;" onclick="downloadSharedFile('${item.id}','${item.format || ''}','${safeDisplayName}','${shareId}','${viewerUid}')"><span class="material-symbols-rounded">download</span> Unduh Berkas</button>
+                ${renameBtnHTML}
+            </div>
         </div>`;
 
     const container = document.getElementById('shared-preview-container');
@@ -3719,6 +3748,34 @@ async function renderSharedFileBody(res, shareId, viewerUid) {
         const url = URL.createObjectURL(blob);
         renderPreviewContent(url, item.format, container, blob);
     } catch (e) { container.innerHTML = `<div style="color:#fff; text-align:center; padding:20px; font-size:13px;">Gagal memuat pratinjau: ${e.message}</div>`; }
+}
+
+// FIX: rename untuk share tipe FILE tunggal (bukan folder) -- hanya
+// tersedia kalau linknya diberi peran Edit (lihat renderSharedFileBody).
+// Validasi cakupan & peran tetap dilakukan di server (action
+// 'shared_rename_file'), ini cuma UI-nya.
+async function sharedRenameStandaloneFile(fileId, currentName, shareId, viewerUid) {
+    const newName = prompt("Nama baru untuk berkas ini:", currentName);
+    if (newName === null) return;
+    const trimmed = newName.trim();
+    if (!trimmed) return showToast("Nama tidak boleh kosong.", true);
+    if (trimmed.length > 300) return showToast("Nama terlalu panjang (maksimal 300 karakter).", true);
+    if (/[<>]/.test(trimmed)) return showToast("Nama tidak boleh mengandung karakter < atau >.", true);
+    showLoadingOverlay("Menyimpan nama baru...", false, false);
+    const res = await callGasAPI('shared_rename_file', { fileId: fileId, newName: trimmed, shareId: shareId, viewerUid: viewerUid });
+    hideLoadingOverlay();
+    if (res && res.success) {
+        showToast("Nama berhasil diubah.", false);
+        const titleEl = document.querySelector('#shared-body h2');
+        if (titleEl) {
+            const dotIdx = titleEl.innerText.lastIndexOf('.');
+            const ext = dotIdx !== -1 ? titleEl.innerText.substring(dotIdx) : '';
+            titleEl.innerText = trimmed + ext;
+        }
+        if (pendingShareResolved && pendingShareResolved.item) pendingShareResolved.item.name = trimmed;
+    } else {
+        showToast((res && res.message) || "Gagal mengubah nama.", true);
+    }
 }
 
 async function downloadSharedFile(fileId, format, displayName, shareId, viewerUid, silentOverlay) {
@@ -3999,9 +4056,20 @@ function openSharedFileMenu(e, fileId) {
     let displayName = item.name + (item.format ? '.' + item.format : '');
     document.getElementById('opt-file-title').innerText = displayName;
     document.getElementById('opt-file-title').title = displayName;
+    // FIX: item DI DALAM folder yang dibagikan dengan akses Edit -- viewer
+    // boleh ganti nama & hapus (ke sampah pemilik), sama seperti pemilik.
+    // Kalau perannya cuma Lihat, menu tetap terbatas ke info & download.
+    let editItemsHTML = '';
+    if (sharedUploadFabRole === 'edit') {
+        editItemsHTML = `
+        <hr style="border: 0; border-top: 1px solid var(--border-color); margin: 6px 0;">
+        <div class="action-menu-item" onclick="sharedRenameFileFromMenu()"><span class="material-symbols-rounded">edit</span> Ganti Nama</div>
+        <div class="action-menu-item danger" onclick="sharedDeleteFileFromMenu()"><span class="material-symbols-rounded">delete</span> Buang ke Sampah</div>`;
+    }
     document.getElementById('file-opt-container').innerHTML = `
         <div class="action-menu-item" onclick="openSharedFileInfoFromMenu()"><span class="material-symbols-rounded">info</span> Detail Berkas</div>
         <div class="action-menu-item" onclick="downloadSharedFileFromMenu()"><span class="material-symbols-rounded">download</span> Download Berkas</div>
+        ${editItemsHTML}
     `;
     document.getElementById('file-options-modal').style.display = 'flex';
 }
@@ -4012,19 +4080,88 @@ function downloadSharedFileFromMenu() {
     let displayName = item.name + (item.format ? '.' + item.format : '');
     downloadSharedFile(item.id, item.format, displayName, pendingShareCode, sharedViewerUid);
 }
+// FIX: ganti nama file di dalam folder share dengan akses Edit. Validasi
+// peran & cakupan folder tetap final di server (action 'shared_rename_file').
+async function sharedRenameFileFromMenu() {
+    closeFileOptions();
+    if (!sharedMenuTargetFile) return;
+    const item = sharedMenuTargetFile;
+    const newName = prompt("Nama baru untuk berkas ini:", item.name);
+    if (newName === null) return;
+    const trimmed = newName.trim();
+    if (!trimmed) return showToast("Nama tidak boleh kosong.", true);
+    if (trimmed.length > 300) return showToast("Nama terlalu panjang (maksimal 300 karakter).", true);
+    if (/[<>]/.test(trimmed)) return showToast("Nama tidak boleh mengandung karakter < atau >.", true);
+    showLoadingOverlay("Menyimpan nama baru...", false, false);
+    const res = await callGasAPI('shared_rename_file', { fileId: item.id, newName: trimmed, shareId: pendingShareCode, viewerUid: sharedViewerUid });
+    hideLoadingOverlay();
+    if (res && res.success) {
+        item.name = trimmed;
+        showToast("Nama berhasil diubah.", false);
+        renderSharedFolderBody(pendingShareResolved, pendingShareCode, sharedViewerUid, sharedCurrentPath);
+    } else { showToast((res && res.message) || "Gagal mengubah nama.", true); }
+}
+// FIX: hapus (pindahkan ke sampah pemilik) file di dalam folder share
+// dengan akses Edit.
+function sharedDeleteFileFromMenu() {
+    closeFileOptions();
+    if (!sharedMenuTargetFile) return;
+    const item = sharedMenuTargetFile;
+    showConfirm("Pindahkan berkas ini ke tempat sampah pemilik?", "Hapus Berkas", async () => {
+        showLoadingOverlay("Menghapus berkas...", false, false);
+        const res = await callGasAPI('shared_delete_file', { fileId: item.id, shareId: pendingShareCode, viewerUid: sharedViewerUid });
+        hideLoadingOverlay();
+        if (res && res.success) {
+            sharedContentsCache.files = (sharedContentsCache.files || []).filter(f => f.id !== item.id);
+            showToast("Berkas dipindahkan ke sampah.", false);
+            renderSharedFolderBody(pendingShareResolved, pendingShareCode, sharedViewerUid, sharedCurrentPath);
+        } else { showToast((res && res.message) || "Gagal menghapus berkas.", true); }
+    });
+}
 function openSharedFileInfoFromMenu() {
     closeFileOptions();
     if (!sharedMenuTargetFile) return;
     const item = sharedMenuTargetFile;
     let displayName = item.name + (item.format ? '.' + item.format : '');
+    const ext = (item.format || '').toLowerCase();
     document.getElementById('info-name').innerText = displayName;
     document.getElementById('info-name').title = displayName;
     document.getElementById('info-format').innerText = (item.format || 'Tidak diketahui');
     document.getElementById('info-size').innerText = formatBytes(item.size);
     document.getElementById('info-location').innerText = sharedCurrentPath || 'Beranda';
     document.getElementById('info-id').innerText = item.id;
-    document.getElementById('info-exif-container').innerHTML = '';
+    const exifContainer = document.getElementById('info-exif-container');
+    exifContainer.innerHTML = '';
+    // FIX: metadata kamera (EXIF) sekarang juga berlaku di halaman shared --
+    // sebelumnya cuma tersedia di Drive milik sendiri. Diambil lewat rute
+    // shared (get_chunks + shareId), yang tetap divalidasi izin akses di server.
+    if (['jpg','jpeg','png','webp','tiff','cr2','nef','arw','dng','raw','rw2','orf','pef','srw'].includes(ext)) {
+        loadExifForSharedFile(item, exifContainer);
+    }
     document.getElementById('file-info-modal').style.display = 'flex';
+}
+
+// Versi shared dari loadExifForCurrentFile() -- ambil chunk lewat rute
+// shared (get_chunks + shareId/viewerUid, tetap tervalidasi server), lalu
+// pakai parseAndShowExif() yang sama (generik, tidak peduli sumber blobnya).
+async function loadExifForSharedFile(item, exifContainer) {
+    exifContainer.innerHTML = `<div style="font-size:12.5px; color:var(--primary); margin-top:12px; display:flex; align-items:center; gap:6px;"><span class="spinner" style="width:14px; height:14px; border-width:2px; border-top-color:var(--primary);"></span> Memuat metadata foto...</div>`;
+    try {
+        const ownerIdForChunks = (pendingShareResolved && pendingShareResolved.ownerId) || (sharedRootItem && sharedRootItem.ownerId);
+        const res = await getSharedFileChunks(item.id, ownerIdForChunks, pendingShareCode, sharedViewerUid);
+        if (!res || !res.success || !res.data) throw new Error("Metadata chunk tidak ditemukan");
+        let chunks = res.data;
+        if (typeof chunks === 'string') chunks = JSON.parse(chunks);
+        if (!Array.isArray(chunks) || chunks.length === 0) throw new Error("Data chunk kosong");
+        chunks.sort((a, b) => a.part - b.part);
+        const pathBlob = await fetchBinaryWithFallback(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${chunks[0].telegramFileId}`);
+        const pathText = await pathBlob.text();
+        const pathData = JSON.parse(pathText);
+        if (!pathData.ok || !pathData.result) throw new Error("Gagal resolusi path file Telegram");
+        const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${pathData.result.file_path}`;
+        const imageBlob = await fetchBinaryWithFallback(fileUrl);
+        await parseAndShowExif(imageBlob, exifContainer);
+    } catch (e) { exifContainer.innerHTML = `<div style="font-size:12px; color:var(--text-muted); margin-top:12px;">Tidak ada metadata ekstra atau gagal memuat.</div>`; }
 }
 
 function openSharedFolderMenu(e, folderPath) {
@@ -4032,10 +4169,35 @@ function openSharedFolderMenu(e, folderPath) {
     sharedMenuTargetFolderPath = folderPath;
     document.getElementById('opt-file-title').innerText = folderPath.split('/').pop();
     document.getElementById('opt-file-title').title = folderPath.split('/').pop();
+    // FIX: subfolder di dalam share dengan akses Edit juga boleh dihapus
+    // (dipindahkan ke sampah pemilik beserta isinya), sama seperti file.
+    let editItemsHTML = '';
+    if (sharedUploadFabRole === 'edit') {
+        editItemsHTML = `
+        <hr style="border: 0; border-top: 1px solid var(--border-color); margin: 6px 0;">
+        <div class="action-menu-item danger" onclick="sharedDeleteFolderFromMenu()"><span class="material-symbols-rounded">delete</span> Buang ke Sampah</div>`;
+    }
     document.getElementById('file-opt-container').innerHTML = `
         <div class="action-menu-item" onclick="downloadSharedFolderFromMenu()"><span class="material-symbols-rounded">folder_zip</span> Download sebagai ZIP</div>
+        ${editItemsHTML}
     `;
     document.getElementById('file-options-modal').style.display = 'flex';
+}
+// FIX: hapus (pindahkan ke sampah pemilik) subfolder beserta isinya, di
+// dalam folder share dengan akses Edit.
+function sharedDeleteFolderFromMenu() {
+    closeFileOptions();
+    if (!sharedMenuTargetFolderPath) return;
+    const path = sharedMenuTargetFolderPath;
+    showConfirm("Pindahkan folder ini beserta isinya ke tempat sampah pemilik?", "Hapus Folder", async () => {
+        showLoadingOverlay("Menghapus folder...", false, false);
+        const res = await callGasAPI('shared_delete_folder', { folderPath: path, shareId: pendingShareCode, viewerUid: sharedViewerUid });
+        hideLoadingOverlay();
+        if (res && res.success) {
+            showToast("Folder dipindahkan ke sampah.", false);
+            navigateSharedTo(sharedCurrentPath);
+        } else { showToast((res && res.message) || "Gagal menghapus folder.", true); }
+    });
 }
 function downloadSharedFolderFromMenu() {
     closeFileOptions();
@@ -5010,8 +5172,18 @@ async function downloadFolderAsZipOwner() {
     }
 }
 
-async function getSharedDataFromSheets(shareCode, viewerUid, subPath = null) {
+async function getSharedDataFromSheets(shareCode, viewerUid, subPath = null, forceLive = false) {
     try {
+        // forceLive: lewati gviz SAMA SEKALI, langsung ke GAS (baca Spreadsheet
+        // live, bukan snapshot cache Google). Dipakai oleh startSharedPolling
+        // untuk memastikan data benar2 ter-refresh secara berkala, bukan cuma
+        // menunggu cache gviz kedaluwarsa sendiri (yang bisa sampai puluhan
+        // detik dan kadang PERNAH kelihatan "sukses" walau isinya masih basi --
+        // itu yang bikin rename kelihatan gak pernah ke-update walau ditunggu).
+        if (forceLive) {
+            return await callGasAPIFetch('resolve_share', { shareId: shareCode, viewerUid: viewerUid, subPath: subPath });
+        }
+
         // FIX: kalau share ini baru saja diubah (privasi/dll) dalam masa tenang,
         // gviz kemungkinan besar masih basi -- langsung ke GAS yang selalu fresh,
         // biar halaman /?share=xxx gak nampilin privasi/isi yang sudah usang.
