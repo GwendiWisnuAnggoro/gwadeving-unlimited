@@ -3192,14 +3192,23 @@ async function handleSharedLink(code) {
         if (ok) { await redirectOwnerToDrive(ownerAccount, res); return; }
     }
 
+    // FIX BUG "LOADING TERUS": kalau sampai titik ini viewer TETAP belum
+    // authorized (baik karena privacy 'private' maupun 'restricted', dan
+    // akun pemiliknya juga tidak ada di perangkat ini untuk auto-login),
+    // res.item TIDAK ADA sama sekali. Sebelumnya kode di bawah ini langsung
+    // baca res.item.path tanpa cek dulu -> exception -> layar macet selamanya
+    // di spinner "Memuat tautan yang dibagikan...". Sekarang ditangani
+    // eksplisit SEBELUM res.item disentuh sama sekali, untuk SEMUA jenis
+    // privasi (dulu cuma privacy 'restricted' yang dicek di sini, padahal
+    // privacy 'private' juga bisa authorized:false tanpa res.item).
+    if (!res.authorized) { renderSharedAuthWall(res); updateSharedViewChrome(); startSharedPolling(code); return; }
+
     sharedRootItem = { path: res.item.path || '', name: res.item.name, itemType: res.itemType, ownerId: res.ownerId };
     sharedCurrentPath = res.item.path || '';
     updateSharedViewChrome();
 
     document.getElementById('shared-owner-banner').style.display = 'flex';
     document.getElementById('shared-owner-banner').innerHTML = `<span class="material-symbols-rounded" style="font-size:18px;">person</span> Dibagikan oleh <b>&nbsp;${res.ownerName}</b>`;
-
-    if (res.privacy === 'restricted' && !res.authorized) { renderSharedAuthWall(res); startSharedPolling(code); return; }
 
     // FIXED: Menggunakan sharedViewerUid bukan viewerUid
     if (res.itemType === 'file') renderSharedFileBody(res, code, sharedViewerUid);
@@ -3351,8 +3360,11 @@ function startSharedPolling(code) {
             return; 
         }
         
-        // JIKA HAK AKSES DICABUT / DIBATASI
-        if (res.privacy === 'restricted' && !res.authorized) { 
+        // JIKA HAK AKSES DICABUT / DIBATASI (berlaku untuk SEMUA jenis privasi,
+        // bukan cuma 'restricted' -- privacy 'private' juga bisa authorized:false
+        // di tengah jalan kalau pemilik mengubah pengaturan berbagi saat viewer
+        // masih membuka halamannya).
+        if (!res.authorized) { 
             stopSharedPolling(); 
             closePreviewModal(); 
             hideSharedUploadFab();
