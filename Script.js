@@ -75,6 +75,32 @@ async function getDirectTelegramUrls(chunksMeta, signal) {
 })();
 
 // ==========================================
+// HIGHLIGHT SEMENTARA UNTUK KARTU FILE TARGET
+// ==========================================
+// Dipakai saat pengguna diarahkan ke sebuah file (mis. dari link share yang
+// ternyata file miliknya sendiri): bukan langsung membuka preview, tapi
+// discroll ke kartunya di tab Berkas lalu diberi kedip/highlight tipis
+// SEMENTARA saja (beberapa detik), bukan permanen.
+(function injectHighlightFlashStyle() {
+    const css = `
+        @keyframes fileCardHighlightFlash {
+            0%   { box-shadow: 0 0 0 0 rgba(59,130,246,0); background-color: transparent; }
+            12%  { box-shadow: 0 0 0 3px rgba(59,130,246,0.55); background-color: rgba(59,130,246,0.14); }
+            50%  { box-shadow: 0 0 0 2px rgba(59,130,246,0.35); background-color: rgba(59,130,246,0.08); }
+            100% { box-shadow: 0 0 0 0 rgba(59,130,246,0); background-color: transparent; }
+        }
+        .file-card-highlight-flash {
+            animation: fileCardHighlightFlash 1.8s ease-out 2;
+            border-radius: 12px;
+        }
+    `;
+    const styleTag = document.createElement('style');
+    styleTag.id = 'highlight-flash-style';
+    styleTag.textContent = css;
+    document.head.appendChild(styleTag);
+})();
+
+// ==========================================
 // TOAST NOTIFICATION LOGIC
 // ==========================================
 let toastTimeout;
@@ -222,6 +248,9 @@ let realtimePollTimer = null;
 let realtimePollBusy = false;
 let lastDataSignature = null;
 let lastSharedSignature = null;
+// ID file yang lagi "ditunggu" untuk di-scroll+highlight begitu kartunya
+// selesai dirender di tab Berkas (dipakai oleh goToFileAndHighlight()).
+let pendingHighlightFileId = null;
 
 // Share modal state
 let shareCtx = { itemId: '', itemType: '', privacy: 'private', allowedUsers: [], shareId: null, linkRole: 'view' };
@@ -1117,7 +1146,16 @@ async function realtimePollTick() {
 
         const data = buildStateArrayFromRaw(raw, currentOwnerId);
         const sig = JSON.stringify(data);
-        if (sig !== lastDataSignature) { lastDataSignature = sig; stateArray = data; renderUI(); }
+        if (sig !== lastDataSignature) {
+            lastDataSignature = sig; stateArray = data; renderUI();
+            // FIX REALTIME: kalau ada modal preview yang lagi terbuka pas
+            // perubahan ini masuk (mis. nama/ukuran file yang sedang dilihat
+            // diubah dari perangkat lain), judul & info di modalnya sendiri
+            // dulu TIDAK pernah ikut ter-refresh (cuma daftar di belakangnya
+            // yang berubah) -- sekarang disamakan lewat fungsi di bawah,
+            // tanpa mengulang proses download/pratinjau isi berkasnya.
+            refreshOpenPreviewMetaIfNeeded();
+        }
 
         const shared = buildSharedWithMeFromRaw(raw, currentOwnerId);
         const sig2 = JSON.stringify(shared);
@@ -1127,6 +1165,36 @@ async function realtimePollTick() {
 }
 function startRealtimePolling() { stopRealtimePolling(); realtimePollTimer = setInterval(realtimePollTick, REALTIME_POLL_MS); }
 function stopRealtimePolling() { if (realtimePollTimer) { clearInterval(realtimePollTimer); realtimePollTimer = null; } }
+
+// Sinkronkan judul/info folder pada modal preview MILIK SENDIRI (bukan
+// halaman share) kalau lagi terbuka saat data berubah dari perangkat lain --
+// tanpa mengulang proses download/pratinjau isi berkasnya (sama seperti
+// updateSharedFileMetaDisplay di halaman share, tapi versi untuk Drive sendiri).
+function refreshOpenPreviewMetaIfNeeded() {
+    const modal = document.getElementById('preview-modal');
+    if (!modal || modal.style.display === 'none') return;
+    if (currentPreviewIndex < 0 || !previewQueue[currentPreviewIndex]) return;
+    const openedId = previewQueue[currentPreviewIndex].id;
+    const source = currentTab === 'trash' ? (stateArray.trash || []) : (stateArray.active || []);
+    const fresh = source.find(f => f.id === openedId);
+    if (!fresh) {
+        // Berkas yang sedang dibuka sudah tidak ada lagi di tab ini (mis.
+        // dipindah ke Sampah / dipulihkan / dihapus permanen dari perangkat lain).
+        closePreviewModal();
+        showToast("Berkas yang sedang dibuka sudah tidak ada lagi di sini.", true);
+        return;
+    }
+    previewQueue[currentPreviewIndex] = fresh;
+    let displayName = fresh.name;
+    const ext = (fresh.format || '').toLowerCase();
+    if (ext && !displayName.toLowerCase().endsWith('.' + ext)) displayName += '.' + ext;
+    const titleEl = document.getElementById('preview-filename');
+    if (titleEl && titleEl.innerText !== displayName) { titleEl.innerText = displayName; titleEl.title = displayName; }
+    let fText = fresh.folder && fresh.folder !== "#*null*#" ? `Folder: ${fresh.folder.split('/').pop()}` : 'Beranda';
+    if (currentTab === 'trash') fText = 'Di Dalam Sampah';
+    const folderInfoEl = document.getElementById('preview-folder-info');
+    if (folderInfoEl) folderInfoEl.innerHTML = `<span class="material-symbols-rounded" style="font-size: 14px;">${currentTab === 'trash' ? 'delete' : 'folder'}</span> ${escapeHtml(fText)}`;
+}
 
 function formatBytes(bytes) {
     if (!bytes || bytes === 0) return '0 Bytes';
@@ -1256,7 +1324,7 @@ function getFolderStats(folderPath) {
 // fungsi generik yang sama ini).
 // ==========================================
 const RENDER_BATCH_SIZE = 60;
-function renderInBatches_(container, items, buildItemFn, emptyHTML) {
+function renderInBatches_(container, items, buildItemFn, emptyHTML, minInitialCount) {
     // Bersihkan observer render-bertahap sebelumnya (kalau container ini
     // dipakai ulang lagi) supaya observer gak numpuk tiap kali render ulang.
     if (container.__batchObserver) { container.__batchObserver.disconnect(); container.__batchObserver = null; }
@@ -1268,9 +1336,15 @@ function renderInBatches_(container, items, buildItemFn, emptyHTML) {
     let renderedCount = 0;
     const sentinel = document.createElement('div');
     sentinel.style.cssText = 'grid-column:1/-1; height:1px;';
+    // PATCH: kalau ada item tertentu yang WAJIB langsung ada di DOM (mis. mau
+    // di-scroll+highlight setelah render), batch PERTAMA dilebarkan sampai
+    // minimal mencakup index item itu -- sisanya tetap lanjut per-batch
+    // seperti biasa begitu user scroll, jadi list ratusan ribu item tetap
+    // gak dirender sekaligus semuanya.
+    const firstBatchSize = Math.max(RENDER_BATCH_SIZE, minInitialCount || 0);
 
-    function renderNextBatch() {
-        const end = Math.min(renderedCount + RENDER_BATCH_SIZE, items.length);
+    function renderNextBatch(batchSize) {
+        const end = Math.min(renderedCount + (batchSize || RENDER_BATCH_SIZE), items.length);
         const frag = document.createDocumentFragment();
         for (let i = renderedCount; i < end; i++) {
             const node = buildItemFn(items[i]);
@@ -1285,11 +1359,11 @@ function renderInBatches_(container, items, buildItemFn, emptyHTML) {
         }
     }
 
-    renderNextBatch(); // batch pertama langsung tampil, gak nunggu scroll
+    renderNextBatch(firstBatchSize); // batch pertama langsung tampil, gak nunggu scroll
     if (renderedCount < items.length) {
         container.appendChild(sentinel);
         const observer = new IntersectionObserver((entries) => {
-            if (entries[0].isIntersecting) renderNextBatch();
+            if (entries[0].isIntersecting) renderNextBatch(RENDER_BATCH_SIZE);
         }, { root: null, rootMargin: '600px' }); // mulai render batch berikutnya sebelum user beneran nyampe bawah
         observer.observe(sentinel);
         container.__batchObserver = observer;
@@ -1451,12 +1525,48 @@ function renderFiles(filterText = '', mode = 'home') {
         if (selectedFileIds.size > 0) selectAllCb.checked = data.every(f => selectedFileIds.has(f.id));
     } else { selectAllCbContainer.style.display = 'none'; }
 
-    renderInBatches_(list, data, buildFileCard_, `<div style="grid-column: 1/-1; text-align:center; padding: 60px 20px; color: var(--text-muted); font-size:14px;">Belum ada berkas di sini.</div>`);
+    // Kalau ada file yang lagi "ditunggu" untuk di-scroll+highlight (lihat
+    // goToFileAndHighlight), cari posisinya dulu supaya batch render pertama
+    // dilebarkan sampai mencakup file itu -- jadi kartunya dijamin ada di DOM
+    // begitu selesai render, gak perlu nunggu observer scroll-lazy dulu.
+    let targetIdx = -1;
+    if (pendingHighlightFileId) targetIdx = data.findIndex(f => String(f.id) === String(pendingHighlightFileId));
+
+    renderInBatches_(list, data, buildFileCard_, `<div style="grid-column: 1/-1; text-align:center; padding: 60px 20px; color: var(--text-muted); font-size:14px;">Belum ada berkas di sini.</div>`, targetIdx >= 0 ? targetIdx + 1 : 0);
+
+    if (targetIdx >= 0) {
+        const targetId = pendingHighlightFileId;
+        pendingHighlightFileId = null;
+        // Tunggu 2 frame supaya layout/paint kartu barunya selesai dulu sebelum discroll.
+        requestAnimationFrame(() => requestAnimationFrame(() => scrollToAndHighlightFile(targetId)));
+    } else if (pendingHighlightFileId && !filterText) {
+        // File targetnya gak ada di daftar mode ini (mis. lagi ada di Sampah) -- batalkan penantiannya.
+        pendingHighlightFileId = null;
+    }
+}
+
+// Scroll ke kartu file tertentu (yang sudah ada di DOM) lalu beri highlight
+// tipis SEMENTARA saja beberapa detik, bukan permanen.
+function scrollToAndHighlightFile(fileId) {
+    const el = document.getElementById('filecard-' + fileId);
+    if (!el) return;
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el.classList.add('file-card-highlight-flash');
+    setTimeout(() => { el.classList.remove('file-card-highlight-flash'); }, 3700);
+}
+
+// Arahkan pengguna ke tab Berkas, lalu scroll+highlight sementara ke file
+// tertentu -- dipakai saat pengguna sendiri membuka link share yang
+// ternyata berkas miliknya sendiri (bukan langsung membuka preview).
+function goToFileAndHighlight(fileId) {
+    pendingHighlightFileId = fileId;
+    switchTab('files');
 }
 
 function buildFileCard_(f) {
     const isSelected = selectedFileIds.has(f.id);
     const card = document.createElement('div');
+    card.id = 'filecard-' + f.id;
     card.className = `file-card ${isSelected ? 'selected' : ''} ${isSelectingMode ? 'selecting' : ''}`;
     const ext = (f.format || '').toLowerCase();
     
@@ -3469,16 +3579,20 @@ async function redirectOwnerToDrive(ownerAccount, res) {
         navigateToFolder(res.item.path || '');
         showToast("Ini adalah folder Anda sendiri — dialihkan ke Drive Anda.", false);
     } else {
-        const folderPath = (res.item.folder && res.item.folder !== "#*null*#") ? res.item.folder : '';
-        navigateToFolder(folderPath);
         let displayName = res.item.name + (res.item.format ? '.' + res.item.format : '');
         // FIX: dulu file yang dituju dicari/disorot lewat SEARCH BOX
         // berdasarkan NAMA -- kalau ada beberapa file dengan nama sama di
         // folder itu, hasilnya ambigu (bisa nyorot file yang salah). Sekarang
-        // langsung dibuka lewat fileId-nya (unik per file), jadi yang tampil
+        // dicocokkan lewat fileId-nya (unik per file), jadi yang di-highlight
         // dijamin persis file yang link-nya dibuka, apa pun namanya.
+        // PATCH: sebelumnya di sini langsung previewFile() (buka modal
+        // preview begitu saja) -- sekarang, seperti Google Drive, TIDAK
+        // langsung dibuka: pengguna diarahkan ke tab Berkas, discroll
+        // otomatis ke file itu, lalu diberi highlight tipis SEMENTARA saja
+        // supaya jelas file mana yang dimaksud tanpa memaksa preview terbuka.
         const exactFile = stateArray.active.find(f => f.id === res.item.id);
-        if (exactFile) previewFile(exactFile.id, exactFile.format, displayName);
+        if (exactFile) goToFileAndHighlight(exactFile.id);
+        else navigateToFolder((res.item.folder && res.item.folder !== "#*null*#") ? res.item.folder : '');
         showToast(`Ini adalah berkas Anda sendiri ("${displayName}") — dialihkan ke Drive Anda.`, false);
     }
 }
@@ -3516,11 +3630,14 @@ async function redirectOwnerToTrash(ownerAccount, res) {
     hideLoadingOverlay();
 
     currentTab = 'trash';
-    const searchInput = document.getElementById('search-input');
+    document.getElementById('search-input').value = '';
     let displayName = '';
     if (res.item && res.item.name) {
         displayName = res.item.name + (res.item.format && res.item.format !== 'sys_folder' ? '.' + res.item.format : '');
-        if (searchInput) searchInput.value = res.item.name;
+        // PATCH: dulu disorot lewat filter NAMA di search box (ambigu kalau
+        // ada beberapa item bernama sama). Sekarang pakai id unik yang sama
+        // seperti mekanisme highlight di tab Berkas.
+        if (res.item.id) pendingHighlightFileId = res.item.id;
     }
     renderUI();
     showToast(displayName ? `Item ini ("${displayName}") ada di Sampah Anda.` : "Item ini ada di Sampah Anda.", false);
@@ -3686,7 +3803,12 @@ function startSharedPolling(code) {
         if (sharedDataSignature !== currentSig) {
             sharedDataSignature = currentSig;
             if (!sharedIsSelecting && res.itemType === 'folder') {
-                renderSharedFolderBody(res, code, sharedViewerUid, sharedCurrentPath);
+                await renderSharedFolderBody(res, code, sharedViewerUid, sharedCurrentPath);
+                // FIX REALTIME: kalau ada modal preview file yang lagi
+                // terbuka sambil browsing folder share ini, judulnya dulu
+                // TIDAK pernah ikut disinkronkan waktu pemilik rename/hapus
+                // file itu dari perangkat lain. Disamakan di sini juga.
+                refreshOpenSharedPreviewMetaIfNeeded();
             } else if (res.itemType === 'file') {
                 // FIX REALTIME: dulu perubahan pada file (mis. nama diganti
                 // pemilik) tidak pernah ke-refresh sama sekali di sini --
@@ -3714,6 +3836,30 @@ function updateSharedFileMetaDisplay(item) {
     if (sizeEl) sizeEl.innerText = formatBytes(item.size);
     const downloadBtn = body.querySelector('button.btn-primary');
     if (downloadBtn) downloadBtn.setAttribute('onclick', `downloadSharedFile('${item.id}','${item.format || ''}','${displayName.replace(/'/g, "\\'")}','${pendingShareCode}','${sharedViewerUid}')`);
+}
+
+// Sinkronkan judul modal preview file yang lagi terbuka SAAT browsing folder
+// yang dibagikan (bukan halaman single-file-share) -- tanpa mengulang proses
+// download/pratinjau isi berkasnya. Kalau file itu ternyata sudah tidak ada
+// lagi di folder ini (dihapus/dipindah pemiliknya), modal ditutup + toast.
+function refreshOpenSharedPreviewMetaIfNeeded() {
+    const modal = document.getElementById('preview-modal');
+    if (!modal || modal.style.display === 'none') return;
+    if (currentSharedPreviewIndex < 0 || !sharedPreviewQueue[currentSharedPreviewIndex]) return;
+    const openedId = sharedPreviewQueue[currentSharedPreviewIndex].id;
+    const fresh = (sharedContentsCache.files || []).find(f => f.id === openedId);
+    if (!fresh) {
+        closePreviewModal();
+        showToast("Berkas yang sedang dibuka sudah tidak ada lagi di sini.", true);
+        return;
+    }
+    sharedPreviewQueue = sharedContentsCache.files || [];
+    currentSharedPreviewIndex = sharedPreviewQueue.findIndex(f => f.id === fresh.id);
+    let displayName = fresh.name;
+    const ext = (fresh.format || '').toLowerCase();
+    if (ext && !displayName.toLowerCase().endsWith('.' + ext)) displayName += '.' + ext;
+    const titleEl = document.getElementById('preview-filename');
+    if (titleEl && titleEl.innerText !== displayName) { titleEl.innerText = displayName; titleEl.title = displayName; }
 }
 
 function stopSharedPolling() { if (sharedPollTimer) { clearInterval(sharedPollTimer); sharedPollTimer = null; } }
