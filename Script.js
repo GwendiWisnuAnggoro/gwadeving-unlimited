@@ -36,6 +36,45 @@ async function getDirectTelegramUrls(chunksMeta, signal) {
 
 
 // ==========================================
+// SISTEM ANTI-2-BARIS: potong teks/nama panjang jadi 1 baris + "..."
+// (title="" tetap dipasang di elemen terkait supaya nama lengkap tetap
+// bisa dibaca lewat tooltip saat hover, dan breadcrumb tetap bisa discroll
+// ke samping seperti sebelumnya).
+// ==========================================
+(function injectTextTruncationStyles() {
+    const css = `
+        .file-title-text, .folder-name, .usr-name, .shared-owner-label,
+        .shared-item-owner, .ext-label, .folder-meta, .file-sub,
+        #view-title, #files-section-title, #folder-section-label,
+        #opt-folder-title, #opt-file-title, #info-name,
+        #share-modal-title, #confirm-title {
+            display: block;
+            max-width: 100%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .folder-info, .file-info-area, .text-wrap, .user-details,
+        .allowed-user-info, .user-details, #share-modal-title {
+            min-width: 0;
+        }
+        #breadcrumb-nav {
+            display: flex;
+            overflow-x: auto;
+            white-space: nowrap;
+            scrollbar-width: none;
+            -webkit-overflow-scrolling: touch;
+        }
+        #breadcrumb-nav::-webkit-scrollbar { display: none; }
+        #breadcrumb-nav span { flex-shrink: 0; }
+    `;
+    const styleTag = document.createElement('style');
+    styleTag.id = 'anti-two-line-text-style';
+    styleTag.textContent = css;
+    document.head.appendChild(styleTag);
+})();
+
+// ==========================================
 // TOAST NOTIFICATION LOGIC
 // ==========================================
 let toastTimeout;
@@ -1193,6 +1232,7 @@ function renderUI() {
         else {
             let segments = currentPath.split('/');
             titleEl.innerText = segments[segments.length - 1];
+            titleEl.title = segments[segments.length - 1];
             let crumbHTML = `<span onclick="navigateToFolder('')">Beranda</span>`; let builtPath = '';
             segments.forEach((seg, idx) => {
                 builtPath = builtPath ? builtPath + '/' + seg : seg;
@@ -1255,7 +1295,7 @@ function buildFolderCard_(fullFolderPath) {
         <input type="checkbox" class="folder-checkbox" ${selectedFolderPaths.has(fullFolderPath) ? 'checked' : ''} onchange="toggleSelectFolder('${safeAttrPath}', this)">
         <div class="folder-icon-box"><span class="material-symbols-rounded">${folderIcon}</span></div>
         <div class="folder-info">
-            <span class="folder-name">${escapeHtml(displayName)}</span>
+            <span class="folder-name" title="${escapeHtml(displayName)}">${escapeHtml(displayName)}</span>
             <span class="folder-meta">${metaText}</span>
             ${shareBadgeHTML}
         </div>
@@ -1283,7 +1323,7 @@ function renderFolderTabOnly(filterText = '') {
         const safeAttrPath = fullFolderPath.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
         card.innerHTML = `
             <div class="folder-icon-box"><span class="material-symbols-rounded">folder</span></div>
-            <div class="folder-info"><span class="folder-name">${escapeHtml(fullFolderPath)}</span><span class="folder-meta">${metaText}</span></div>
+            <div class="folder-info"><span class="folder-name" title="${escapeHtml(fullFolderPath)}">${escapeHtml(fullFolderPath)}</span><span class="folder-meta">${metaText}</span></div>
             <button class="icon-btn" style="padding:4px; margin-right:-4px;" onclick="openFolderOptions(event, '${safeAttrPath}')"><span class="material-symbols-rounded" style="font-size:22px;">more_vert</span></button>
         `;
         return card;
@@ -1687,6 +1727,7 @@ function openFolderOptions(e, path) {
     e.stopPropagation(); 
     selectedFolderForAction = path;
     document.getElementById('opt-folder-title').innerText = path.split('/').pop();
+    document.getElementById('opt-folder-title').title = path.split('/').pop();
     
     const container = document.getElementById('folder-opt-container');
     container.innerHTML = `
@@ -1756,6 +1797,7 @@ function openFileMenu(e, fileId) {
     if (ext && !displayFilename.toLowerCase().endsWith('.' + ext)) displayFilename += '.' + ext;
 
     document.getElementById('opt-file-title').innerText = displayFilename;
+    document.getElementById('opt-file-title').title = displayFilename;
     const container = document.getElementById('file-opt-container');
     let html = '';
     
@@ -1792,6 +1834,7 @@ function openFileInfoModal() {
     if (ext && !displayFilename.toLowerCase().endsWith('.' + ext)) displayFilename += '.' + ext;
 
     document.getElementById('info-name').innerText = displayFilename;
+    document.getElementById('info-name').title = displayFilename;
     document.getElementById('info-format').innerText = ext || 'Tidak diketahui';
     document.getElementById('info-size').innerText = formatBytes(selectedFileForAction.size);
     document.getElementById('info-location').innerText = selectedFileForAction.folder ? selectedFileForAction.folder : 'Beranda';
@@ -2791,6 +2834,7 @@ async function openShareModal(itemType) {
         : targetId.split('/').pop();
         
     document.getElementById('share-modal-title').innerText = 'Bagikan "' + displayName + '"';
+    document.getElementById('share-modal-title').title = 'Bagikan "' + displayName + '"';
     document.getElementById('share-modal').style.display = 'flex';
     document.getElementById('share-link-box').style.display = 'none';
     
@@ -2906,7 +2950,7 @@ function renderAllowedUsersList() {
             <div class="allowed-user-info">
                 <div class="user-avatar"><span class="material-symbols-rounded" style="font-size:18px;">person</span></div>
                 <div class="text-wrap">
-                    <span class="usr-name">${escapeHtml(u.username)}</span>
+                    <span class="usr-name" title="${escapeHtml(u.username)}">${escapeHtml(u.username)}</span>
                     <span class="usr-id">ID: ${escapeHtml(u.uid)}</span>
                 </div>
             </div>
@@ -2943,7 +2987,7 @@ function onShareUserSearchInput() {
                 item.innerHTML = `
                     <div class="user-avatar"><span class="material-symbols-rounded" style="font-size:20px;">person</span></div>
                     <div class="user-details">
-                        <span class="usr-name">${escapeHtml(u.username)}</span>
+                        <span class="usr-name" title="${escapeHtml(u.username)}">${escapeHtml(u.username)}</span>
                         <span class="usr-id">ID: ${escapeHtml(u.uid)}</span>
                     </div>
                 `;
@@ -3262,7 +3306,7 @@ function renderSharedBreadcrumb(res, subPath) {
         return;
     }
     el.style.display = 'flex';
-    let html = `<span class="shared-owner-label" style="cursor:default;color:var(--text-muted)">Dibagikan oleh ${escapeHtml(res.ownerName || 'Pengguna')}</span>`;
+    let html = `<span class="shared-owner-label" title="Dibagikan oleh ${escapeHtml(res.ownerName || 'Pengguna')}" style="cursor:default;color:var(--text-muted)">Dibagikan oleh ${escapeHtml(res.ownerName || 'Pengguna')}</span>`;
     const curParts = (subPath || '').split('/').filter(Boolean);
     let accum = '';
     curParts.forEach((seg, idx) => {
@@ -3488,7 +3532,7 @@ async function renderSharedFolderBody(res, shareId, viewerUid, subPath) {
         card.innerHTML = `
             <input type="checkbox" class="folder-checkbox" ${isSelected ? 'checked' : ''} onchange="toggleSharedFolderSelect(event,'${safePath}', this)">
             <div class="folder-icon-box"><span class="material-symbols-rounded">folder</span></div>
-            <div class="folder-info"><span class="folder-name">${sf.split('/').pop()}</span></div>
+            <div class="folder-info"><span class="folder-name" title="${escapeHtml(sf.split('/').pop())}">${escapeHtml(sf.split('/').pop())}</span></div>
             <button class="icon-btn folder-menu-btn" onclick="openSharedFolderMenu(event, '${safePath}')"><span class="material-symbols-rounded" style="font-size:20px;">more_vert</span></button>
         `;
         attachLongPressHandlers(card, () => {
@@ -3596,6 +3640,7 @@ function openSharedFileMenu(e, fileId) {
     sharedMenuTargetFile = item;
     let displayName = item.name + (item.format ? '.' + item.format : '');
     document.getElementById('opt-file-title').innerText = displayName;
+    document.getElementById('opt-file-title').title = displayName;
     document.getElementById('file-opt-container').innerHTML = `
         <div class="action-menu-item" onclick="openSharedFileInfoFromMenu()"><span class="material-symbols-rounded">info</span> Detail Berkas</div>
         <div class="action-menu-item" onclick="downloadSharedFileFromMenu()"><span class="material-symbols-rounded">download</span> Download Berkas</div>
@@ -3615,6 +3660,7 @@ function openSharedFileInfoFromMenu() {
     const item = sharedMenuTargetFile;
     let displayName = item.name + (item.format ? '.' + item.format : '');
     document.getElementById('info-name').innerText = displayName;
+    document.getElementById('info-name').title = displayName;
     document.getElementById('info-format').innerText = (item.format || 'Tidak diketahui');
     document.getElementById('info-size').innerText = formatBytes(item.size);
     document.getElementById('info-location').innerText = sharedCurrentPath || 'Beranda';
@@ -3627,6 +3673,7 @@ function openSharedFolderMenu(e, folderPath) {
     e.stopPropagation();
     sharedMenuTargetFolderPath = folderPath;
     document.getElementById('opt-file-title').innerText = folderPath.split('/').pop();
+    document.getElementById('opt-file-title').title = folderPath.split('/').pop();
     document.getElementById('file-opt-container').innerHTML = `
         <div class="action-menu-item" onclick="downloadSharedFolderFromMenu()"><span class="material-symbols-rounded">folder_zip</span> Download sebagai ZIP</div>
     `;
@@ -4211,6 +4258,7 @@ async function loadPreviewItem(index) {
     // Update Teks Judul (1 baris) & Nama Folder
     const titleEl = document.getElementById('preview-filename');
     titleEl.innerText = displayName;
+    titleEl.title = displayName;
     titleEl.style.whiteSpace = 'nowrap';
     titleEl.style.overflow = 'hidden';
     titleEl.style.textOverflow = 'ellipsis';
@@ -4365,6 +4413,7 @@ async function loadSharedPreviewItem(index, shareId, viewerUid) {
 
     const titleEl = document.getElementById('preview-filename');
     titleEl.innerText = displayName;
+    titleEl.title = displayName;
     titleEl.style.whiteSpace = 'nowrap';
     titleEl.style.overflow = 'hidden';
     titleEl.style.textOverflow = 'ellipsis';
