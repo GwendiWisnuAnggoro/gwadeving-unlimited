@@ -171,6 +171,7 @@ let clipboardItem = null; // { type: 'file'|'folder', id/path, label }
 let uploadQueue = [];
 let editingTargetAccount = null;
 let isUploadCancelled = false;
+let lastUploadFailureMessage = null;
 let isUploadInProgress = false;
 let loginViewCloseable = false;
 let sharedWithMeItems = [];
@@ -214,6 +215,39 @@ let previewQueue = [];
 let currentPreviewIndex = -1;
 let sharedPreviewQueue = [];
 let currentSharedPreviewIndex = -1;
+
+// ==========================================
+// FIX: ANTI CACHE-BASI GVIZ
+// ==========================================
+// Root cause 2 bug: "rename folder sempat kedeteksi hilang" dan "ubah privasi
+// share gak nempel di halaman shared". Keduanya sama-sama gara-gara data
+// dibaca lewat endpoint gviz (fetchRawSheets -> docs.google.com/.../gviz/tq),
+// yang punya cache internal di sisi Google (BUKAN cache browser -- parameter
+// "_=Date.now()" di URL-nya gak ngaruh ke ini) selama puluhan detik setelah
+// ada tulisan baru ke Sheet. Jadi begitu kita habis nulis (rename/ubah privasi),
+// polling berikutnya yang baca via gviz masih dapat snapshot LAMA dan menimpa
+// tampilan yang tadinya sudah benar (bikin folder "hilang" sesaat / privasi
+// balik seperti semula) -- sampai cache gviz-nya sendiri kedaluwarsa.
+//
+// Solusi: begitu ada aksi tulis, tandai "masa tenang" beberapa detik. Selama
+// masa tenang itu, jangan percaya hasil gviz -- pakai jalur GAS langsung
+// (callGasAPI / callGasAPIFetch) yang selalu baca data ter-update, walau
+// sedikit lebih lambat/berat. Ditandai per-scope (per ownerId untuk data
+// sendiri, per shareId untuk halaman share) dan disimpan di localStorage
+// supaya juga kepakai lintas tab/lintas reload (kasus "halaman shared" biasanya
+// dibuka di tab/reload terpisah dari tempat privasinya diubah).
+const GVIZ_COOLDOWN_MS = 45000; // Cache gviz Google umumnya kedaluwarsa < 1 menit
+function markRecentWrite(scopeKey) {
+    if (!scopeKey) return;
+    try { localStorage.setItem('gviz_cooldown_' + scopeKey, String(Date.now())); } catch (e) {}
+}
+function isInGvizCooldown(scopeKey) {
+    if (!scopeKey) return false;
+    try {
+        const t = parseInt(localStorage.getItem('gviz_cooldown_' + scopeKey) || '0', 10);
+        return (Date.now() - t) < GVIZ_COOLDOWN_MS;
+    } catch (e) { return false; }
+}
 
 
 document.addEventListener('DOMContentLoaded', async () => {
@@ -1028,6 +1062,11 @@ async function realtimePollTick() {
     if (!currentOwnerId || realtimePollBusy) return;
     realtimePollBusy = true;
     try {
+        // FIX: kalau baru saja ada tulisan (rename/dsb) punya akun ini, gviz
+        // masih kemungkinan besar basi -- lewati tick ini daripada menimpa
+        // balik state yang sudah benar dengan snapshot lama.
+        if (isInGvizCooldown(currentOwnerId)) { realtimePollBusy = false; return; }
+
         const raw = await fetchRawSheets();
 
         const data = buildStateArrayFromRaw(raw, currentOwnerId);
@@ -1077,6 +1116,10 @@ function isInsideTrashedFolder(path, trashedFolderPaths) {
 
 async function syncData() {
     try {
+        // FIX: selama masa tenang pasca-tulis, langsung pakai jalur GAS (selalu
+        // fresh) daripada gviz (bisa basi) supaya syncData() gak balik menimpa
+        // hasil rename/aksi lain yang baru saja dilakukan.
+        if (isInGvizCooldown(currentOwnerId)) throw new Error('gviz_cooldown_skip');
         const raw = await fetchRawSheets();
         const data = buildStateArrayFromRaw(raw, currentOwnerId);
         lastDataSignature = JSON.stringify(data);
@@ -2572,6 +2615,7 @@ async function startMultiUpload() {
     if (isUploadInProgress) return; 
     isUploadInProgress = true;
     isUploadCancelled = false;
+    lastUploadFailureMessage = null;
     
     const btn = document.getElementById('btn-upload'); 
     btn.disabled = true;
@@ -2756,6 +2800,7 @@ async function startMultiUpload() {
             catch (e) { 
                 isUploadCancelled = true; 
                 uploadFailed = true;
+                lastUploadFailureMessage = e.message; // FIX: simpan alasan asli, jangan ketutup pesan "dibatalkan" generik di bawah
                 sText.innerHTML = `<span style="color:var(--danger);"><span class="material-symbols-rounded" style="vertical-align:middle; font-size:18px;">error</span> Gagal: ${e.message}. Proses dihentikan.</span>`;
                 showToast(`Upload gagal dan dihentikan: ${e.message}`, true);
                 break; 
@@ -2789,7 +2834,11 @@ async function startMultiUpload() {
     }
 
     if (isUploadCancelled) { 
-        showToast("Proses upload dibatalkan.", true); 
+        // FIX: dulu selalu bilang "dibatalkan" walau sebenarnya GAGAL (mis. koneksi
+        // putus di tengah Safari) -- user jadi ngira dia sendiri yang batalin,
+        // padahal itu kegagalan jaringan/CORS/server. Sekarang bedakan pesannya.
+        showToast(lastUploadFailureMessage ? `Upload berhenti: ${lastUploadFailureMessage}` : "Proses upload dibatalkan.", true); 
+        lastUploadFailureMessage = null;
         box.style.display = 'none'; btn.disabled = false; isUploadInProgress = false; 
         renderUploadQueue();
     }
@@ -3040,6 +3089,7 @@ async function saveShare() {
     if (res && res.success) {
         shareCtx.shareId = res.shareId;
         shareCtx.isDirty = false;
+        markRecentWrite(res.shareId); // FIX: halaman /?share=xxx pakai jalur GAS dulu selama cooldown, bukan gviz basi
         showToast("Pengaturan berbagi disimpan!", false);
         renderShareModalState();
         renderUI();
@@ -4231,7 +4281,22 @@ async function renderPreviewContent(url, ext, container, blob) {
             // FIX #3: pasang listener 'error' -- beberapa codec di dalam mkv/mov/avi
             // tidak didukung native oleh browser, video tag akan diam saja tanpa ini.
             v.addEventListener('error', () => {
-                container.innerHTML = `<div style="color:#fff;text-align:center;max-width:420px;"><span class="material-symbols-rounded" style="font-size:48px;">movie_off</span><p style="margin-top:10px;font-size:13px;">Video ini memakai codec yang tidak didukung browser Anda dan tidak bisa diputar langsung.</p><button class="btn-primary" style="margin-top:14px;padding:8px 18px;" onclick="downloadSelectedFile()">Download Berkas</button></div>`;
+                // FIX: kode error 4 (MEDIA_ERR_SRC_NOT_SUPPORTED) di Safari BUKAN
+                // cuma dipicu codec yang tidak didukung -- Safari juga melempar
+                // kode yang SAMA persis kalau server streaming (Cloudflare Worker
+                // /stream) tidak mengirim header "Accept-Ranges: bytes" + respons
+                // "206 Partial Content" yang benar untuk permintaan Range. Chrome/
+                // Android lebih toleran dan sering tetap main walau header itu
+                // hilang, makanya gejalanya "cuma di iPhone Safari doang". Pesan
+                // di bawah dibedakan supaya gak nyasar user ngira videonya rusak
+                // padahal soal dukungan Range di sisi Worker.
+                const code = v.error && v.error.code;
+                const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+                let msg = 'Video ini memakai codec yang tidak didukung browser Anda dan tidak bisa diputar langsung.';
+                if (code === 4 && isSafari) {
+                    msg = 'Video gagal diputar di Safari. Ini sering terjadi karena server streaming belum mendukung "Range request" (dibutuhkan Safari, tapi tidak selalu oleh browser lain) -- bukan berarti codec videonya pasti tidak didukung.';
+                }
+                container.innerHTML = `<div style="color:#fff;text-align:center;max-width:420px;"><span class="material-symbols-rounded" style="font-size:48px;">movie_off</span><p style="margin-top:10px;font-size:13px;">${msg}</p><button class="btn-primary" style="margin-top:14px;padding:8px 18px;" onclick="downloadSelectedFile()">Download Berkas</button></div>`;
             });
             initCustomVideoPlayer(v);
             return;
@@ -4777,6 +4842,8 @@ async function executeRenameFolder() {
             if (f.folder === oldPath) f.folder = newPath;
             else if (f.folder && f.folder.startsWith(oldPath + '/')) f.folder = f.folder.replace(oldPath, newPath);
         });
+        markRecentWrite(currentOwnerId); // FIX: cegah polling gviz basi menimpa balik hasil rename
+        lastDataSignature = JSON.stringify(stateArray); // biar polling gak anggap ini "beda" pas cooldown selesai
         renderUI();
         showToast("Nama folder berhasil diganti!", false);
     } else { showToast((res && res.message) || "Gagal mengganti nama folder.", true); }
@@ -4832,6 +4899,13 @@ async function downloadFolderAsZipOwner() {
 
 async function getSharedDataFromSheets(shareCode, viewerUid, subPath = null) {
     try {
+        // FIX: kalau share ini baru saja diubah (privasi/dll) dalam masa tenang,
+        // gviz kemungkinan besar masih basi -- langsung ke GAS yang selalu fresh,
+        // biar halaman /?share=xxx gak nampilin privasi/isi yang sudah usang.
+        if (isInGvizCooldown(shareCode)) {
+            return await callGasAPIFetch('resolve_share', { shareId: shareCode, viewerUid: viewerUid, subPath: subPath });
+        }
+
         const raw = await fetchRawSheets().catch(() => null);
 
         if (raw && raw.sharesRows && raw.sharesRows.length > 0) {
