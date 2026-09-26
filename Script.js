@@ -2715,6 +2715,21 @@ async function startMultiUpload() {
         const uniqueId = 'FILE_' + Date.now() + '_' + currentIdx;
         const prefix = `[${currentIdx}/${totalFiles}] `;
 
+        // PATCH: DETEKSI FILE 0 BYTE SEBELUM DIKIRIM
+        // Kalau file dipilih dari iCloud Drive/Files dan belum full ke-download
+        // ke device (masih placeholder), Safari/iOS kadang tetap kasih File
+        // object ke web tapi isinya kosong (size 0) atau gagal dibaca. Kalau
+        // dibiarkan lolos, ini baru ketahuan gagal SETELAH round-trip ke
+        // server, dengan pesan generik dari Telegram ("there is no document
+        // in the request") yang membingungkan. Sekarang dicek duluan di sini
+        // supaya pesannya jelas dan file lain di antrian tetap lanjut diproses.
+        if (!fileInput.size || fileInput.size === 0) {
+            showToast(`${customName}: file 0 byte / belum sepenuhnya terunduh (biasanya file iCloud/Files yang belum dibuka). Buka dulu filenya di app Files/Photos sampai terlihat penuh, lalu upload ulang.`, true);
+            uploadQueue.shift();
+            renderUploadQueue();
+            continue;
+        }
+
         if (fileNameText) fileNameText.innerText = customName;
         sText.innerHTML = `${prefix}Menyiapkan...`;
 
@@ -2840,7 +2855,32 @@ async function startMultiUpload() {
         const CHUNK_MAX_ATTEMPTS = Math.max(3, WORKER_POOL.length * 2); // tiap worker dapat >=2 kesempatan
         for (let i = 0; i < totalChunks; i++) {
             if (isUploadCancelled) break;
-            const chunkBlob = fileInput.slice(i * CHUNK_SIZE, Math.min((i + 1) * CHUNK_SIZE, fileInput.size));
+            let chunkBlob = fileInput.slice(i * CHUNK_SIZE, Math.min((i + 1) * CHUNK_SIZE, fileInput.size));
+
+            // PATCH: WORKAROUND BUG SAFARI/WEBKIT -- file yang dipilih dari
+            // Photo Library (bukan app Files) kadang size-nya kebaca BENAR di
+            // JS, tapi saat Blob aslinya di-stream ulang oleh XHR ke dalam
+            // body FormData, isinya gagal ke-attach dengan sempurna (server
+            // terima bagian dokumen KOSONG walau ukurannya normal di app).
+            // Fix-nya: paksa baca semua byte-nya ke memori (arrayBuffer) DI
+            // SINI, lalu bungkus jadi Blob baru murni-dari-memori sebelum
+            // dipakai berulang di FormData -- ini menghindari Safari mesti
+            // "streaming lazy" dari referensi asset asli tiap kali dikirim.
+            try {
+                const buf = await chunkBlob.arrayBuffer();
+                if (!buf || buf.byteLength === 0) {
+                    throw new Error('Bagian file ini terbaca 0 byte oleh browser (kemungkinan masalah akses file di iOS/Safari). Coba pilih ulang filenya, atau buka dulu file aslinya di app Foto/Files sebelum upload.');
+                }
+                chunkBlob = new Blob([buf], { type: chunkBlob.type || 'application/octet-stream' });
+            } catch (readErr) {
+                isUploadCancelled = true;
+                uploadFailed = true;
+                lastUploadFailureMessage = readErr.message || 'Gagal membaca isi file dari device.';
+                sText.innerHTML = `<span style="color:var(--danger);">${lastUploadFailureMessage}</span>`;
+                showToast(`Upload gagal: ${lastUploadFailureMessage}`, true);
+                break;
+            }
+
             const caption = `[${uniqueId}] ${customName}.${format} - Part ${i + 1}/${totalChunks}`;
 
             let chunkResult = null;
