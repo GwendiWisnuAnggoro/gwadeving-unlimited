@@ -3223,8 +3223,15 @@ async function redirectOwnerToDrive(ownerAccount, res) {
     pendingShareCode = null; 
     pendingShareResolved = null; 
 
-    // Akun aktif sudah beneran dipindah ke akun pemilik oleh
-    // authenticateToOwnerAccount() sebelum fungsi ini dipanggil.
+    // FIX: paksa aktifkan akun pemilik lagi di sini juga (jaga-jaga) --
+    // sebelumnya kita cuma PERCAYA bahwa authenticateToOwnerAccount() di
+    // pemanggil sudah benar-benar mengubah currentOwnerId. Kalau karena
+    // sebab apapun itu belum "nempel" (mis. dipanggil dari cabang lain),
+    // syncData() di bawah akan salah ambil data akun yang MASIH AKTIF lama,
+    // sehingga berkas yang dicari "tidak ketemu". Dipanggil ulang di sini
+    // supaya currentOwnerId dijamin benar SEBELUM syncData() jalan.
+    setActiveAccount(ownerAccount);
+
     document.getElementById('shared-view').style.display = 'none';
     document.getElementById('login-view').style.display = 'none';
     document.getElementById('app-layout').style.display = 'flex';
@@ -3233,6 +3240,21 @@ async function redirectOwnerToDrive(ownerAccount, res) {
 
     showLoadingOverlay("Membuka item Anda...", false, false);
     await syncData();
+
+    // FIX: kadang data sheet (gviz) belum ke-update di sisi Google beberapa
+    // detik setelah aksi terakhir (delay cache bawaan Google, di luar kendali
+    // kita), jadi berkas yang baru saja dibuka linknya belum muncul di
+    // stateArray meskipun akun sudah benar. Kalau item belum ketemu, tunggu
+    // sebentar lalu sync ULANG sekali sebelum benar-benar menyerah, supaya
+    // pencarian di bawah tidak "kosong" gara-gara balapan waktu ini.
+    const stillMissing = res.itemType === 'folder'
+        ? !getAllFolderPaths().some(p => p.toLowerCase() === (res.item.path || '').toLowerCase())
+        : !stateArray.active.some(f => f.id === res.item.id);
+    if (stillMissing) {
+        await new Promise(r => setTimeout(r, 1200));
+        await syncData();
+    }
+
     startSharedWithMePolling();
     hideLoadingOverlay();
 
@@ -3256,8 +3278,11 @@ async function redirectOwnerToTrash(ownerAccount, res) {
     pendingShareCode = null;
     pendingShareResolved = null;
 
-    // Akun aktif sudah beneran dipindah ke akun pemilik oleh
-    // authenticateToOwnerAccount() sebelum fungsi ini dipanggil.
+    // FIX: paksa aktifkan akun pemilik lagi di sini juga (jaga-jaga, sama
+    // seperti di redirectOwnerToDrive) -- supaya currentOwnerId dijamin benar
+    // sebelum syncData() mengambil datanya.
+    setActiveAccount(ownerAccount);
+
     document.getElementById('shared-view').style.display = 'none';
     document.getElementById('login-view').style.display = 'none';
     document.getElementById('app-layout').style.display = 'flex';
@@ -3266,6 +3291,15 @@ async function redirectOwnerToTrash(ownerAccount, res) {
 
     showLoadingOverlay("Membuka Sampah Anda...", false, false);
     await syncData();
+
+    // FIX: sama seperti di redirectOwnerToDrive -- kalau item belum muncul
+    // (kemungkinan cache gviz belum ter-update), sync ulang sekali sebelum
+    // menampilkan tab Sampah.
+    if (res.item && res.item.id && !stateArray.trash.some(f => f.id === res.item.id)) {
+        await new Promise(r => setTimeout(r, 1200));
+        await syncData();
+    }
+
     startSharedWithMePolling();
     hideLoadingOverlay();
 
@@ -3394,9 +3428,33 @@ function startSharedPolling(code) {
             sharedDataSignature = currentSig;
             if (!sharedIsSelecting && res.itemType === 'folder') {
                 renderSharedFolderBody(res, code, sharedViewerUid, sharedCurrentPath);
+            } else if (res.itemType === 'file') {
+                // FIX REALTIME: dulu perubahan pada file (mis. nama diganti
+                // pemilik) tidak pernah ke-refresh sama sekali di sini --
+                // signature-nya sempat dihitung ulang tapi tidak pernah
+                // dipakai untuk apa pun kalau itemType 'file'. Sekarang judul
+                // & ukurannya diperbarui langsung TANPA mengulang proses
+                // unduh/pratinjau berkas (supaya tidak boros kuota & tidak
+                // memutus pratinjau yang sedang berjalan).
+                updateSharedFileMetaDisplay(res.item);
             }
         }
     }, 1000);
+}
+
+// Perbarui judul & info ukuran di halaman file yang dibagikan secara
+// realtime (dipanggil dari tick polling), tanpa mengulang fetch/pratinjau
+// isi berkasnya -- cuma teksnya saja yang disinkronkan.
+function updateSharedFileMetaDisplay(item) {
+    const body = document.getElementById('shared-body');
+    if (!body || !body.querySelector('#shared-preview-container')) return; // bukan sedang di tampilan file
+    let displayName = item.name + (item.format ? '.' + item.format : '');
+    const titleEl = body.querySelector('h2');
+    const sizeEl = body.querySelector('p');
+    if (titleEl) { titleEl.innerText = displayName; titleEl.title = displayName; }
+    if (sizeEl) sizeEl.innerText = formatBytes(item.size);
+    const downloadBtn = body.querySelector('button.btn-primary');
+    if (downloadBtn) downloadBtn.setAttribute('onclick', `downloadSharedFile('${item.id}','${item.format || ''}','${displayName.replace(/'/g, "\\'")}','${pendingShareCode}','${sharedViewerUid}')`);
 }
 
 function stopSharedPolling() { if (sharedPollTimer) { clearInterval(sharedPollTimer); sharedPollTimer = null; } }
