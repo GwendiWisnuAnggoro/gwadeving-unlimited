@@ -2467,13 +2467,20 @@ function renderUploadQueue() {
 // jika event asli ternyata tidak muncul lagi (umum terjadi di sebagian WebView HP).
 let lastKnownUploadSpeedBps = 0;
 
-function uploadChunkXHR(formData, startBytes, totalFileSize, onProgress) {
+function uploadChunkXHR(formData, startBytes, totalFileSize, onProgress, forceWorker) {
     return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         currentActiveXhr = xhr;
         
-        // Pilih Worker acak untuk mengunggah chunk ini
-        const activeWorker = getRandomWorker();
+        // PATCH: sebelumnya SELALU acak (getRandomWorker()), jadi kalau chunk ini
+        // sedang di-retry gara-gara worker pertama gagal, ada kemungkinan (1/N)
+        // random-nya balik lagi ke worker yang SAMA yang baru saja gagal --
+        // retry jadi percuma. forceWorker (opsional) dipakai oleh pemanggil
+        // (loop retry di startMultiUpload) untuk MEMAKSA worker tertentu yang
+        // BEDA dari percobaan sebelumnya. Kalau tidak diisi, perilaku lama
+        // (acak) tetap dipakai -- tidak mengubah pemanggil lain (mis. upload
+        // thumbnail) yang belum diupdate untuk kirim parameter ini.
+        const activeWorker = forceWorker || getRandomWorker();
         const uploadUrl = `${activeWorker}/upload?token=${WORKER_PASSWORD}&bot_token=${TELEGRAM_BOT_TOKEN}`;
         
         // Ubah target POST ke Worker Anda
@@ -2771,53 +2778,95 @@ async function startMultiUpload() {
         let uploadFailed = false;
         let fileStartTime = Date.now(); 
 
+        // ==========================================
+        // FIX #8: RETRY PER-CHUNK LINTAS WORKER (biar file besar -- yang
+        // otomatis jadi BANYAK chunk -- gak langsung gagal total cuma gara2
+        // 1 chunk kena error sesaat di 1 Worker (limit/timeout/hiccup
+        // jaringan). Sebelumnya: 1 chunk gagal -> SELURUH upload file itu
+        // langsung dibatalkan (isUploadCancelled=true), padahal chunk lain
+        // sebelumnya sudah berhasil dan Worker cadangan mungkin sehat2 saja.
+        // Sekarang: tiap chunk dicoba ke SEMUA Worker di pool secara
+        // bergiliran (bukan acak, supaya gak kebetulan balik ke Worker yang
+        // baru gagal) + jeda (backoff) yang makin lama tiap percobaan.
+        // Chunk baru benar2 dianggap gagal (dan upload file ini dihentikan)
+        // kalau SEMUA Worker sudah dicoba dan semuanya tetap gagal.
+        // ==========================================
+        const CHUNK_MAX_ATTEMPTS = Math.max(3, WORKER_POOL.length * 2); // tiap worker dapat >=2 kesempatan
         for (let i = 0; i < totalChunks; i++) {
             if (isUploadCancelled) break;
             const chunkBlob = fileInput.slice(i * CHUNK_SIZE, Math.min((i + 1) * CHUNK_SIZE, fileInput.size));
-            const fd = new FormData(); 
-            fd.append('chat_id', TELEGRAM_CHAT_ID); 
-            fd.append('document', chunkBlob, `part_${i + 1}.dat`); 
-            fd.append('caption', `[${uniqueId}] ${customName}.${format} - Part ${i + 1}/${totalChunks}`);
-            
-            try { 
-                const tg = await uploadChunkXHR(fd, bytesSoFar, fileInput.size, (loaded, total) => {
-                    let percent = ((loaded / total) * 100).toFixed(1);
-                    if (percent > 100) percent = 100;
+            const caption = `[${uniqueId}] ${customName}.${format} - Part ${i + 1}/${totalChunks}`;
 
-                    if (progressBar) progressBar.style.width = percent + '%';
-                    if (percentEl) percentEl.innerText = percent + '%';
-                    if (byteStatusEl) byteStatusEl.innerText = `${formatBytes(loaded)} / ${formatBytes(total)}`;
+            let chunkResult = null;
+            let chunkErr = null;
+            for (let attempt = 0; attempt < CHUNK_MAX_ATTEMPTS; attempt++) {
+                if (isUploadCancelled) break;
+                // FormData harus dibuat baru tiap percobaan -- body-nya (blob)
+                // sekali "terpakai" oleh 1 request XHR, jadi kalau dipakai
+                // ulang lintas percobaan sebagian browser bisa kirim body
+                // kosong/rusak di percobaan kedua dst.
+                const fd = new FormData();
+                fd.append('chat_id', TELEGRAM_CHAT_ID);
+                fd.append('document', chunkBlob, `part_${i + 1}.dat`);
+                fd.append('caption', caption);
+                // Bergiliran round-robin ke tiap Worker di pool (attempt 0 -> worker[0],
+                // attempt 1 -> worker[1], dst, lalu ulang lagi dari awal).
+                const targetWorker = WORKER_POOL[attempt % WORKER_POOL.length];
 
-                    let now = Date.now();
-                    let elapsed = (now - fileStartTime) / 1000;
-                    let etaString = "Menghitung...";
-                    
-                    if (elapsed > 0.5 && loaded > 0) {
-                        let speed = loaded / elapsed; 
-                        let remaining = total - loaded;
-                        let eta = remaining / speed; 
-                        if (eta !== Infinity && !isNaN(eta)) {
-                            let mins = Math.floor(eta / 60);
-                            let secs = Math.floor(eta % 60);
-                            etaString = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+                if (attempt > 0) sText.innerHTML = `${prefix}Percobaan ulang chunk ${i + 1}/${totalChunks} (server ${(attempt % WORKER_POOL.length) + 1}/${WORKER_POOL.length})...`;
+
+                try {
+                    chunkResult = await uploadChunkXHR(fd, bytesSoFar, fileInput.size, (loaded, total) => {
+                        let percent = ((loaded / total) * 100).toFixed(1);
+                        if (percent > 100) percent = 100;
+
+                        if (progressBar) progressBar.style.width = percent + '%';
+                        if (percentEl) percentEl.innerText = percent + '%';
+                        if (byteStatusEl) byteStatusEl.innerText = `${formatBytes(loaded)} / ${formatBytes(total)}`;
+
+                        let now = Date.now();
+                        let elapsed = (now - fileStartTime) / 1000;
+                        let etaString = "Menghitung...";
+
+                        if (elapsed > 0.5 && loaded > 0) {
+                            let speed = loaded / elapsed;
+                            let remaining = total - loaded;
+                            let eta = remaining / speed;
+                            if (eta !== Infinity && !isNaN(eta)) {
+                                let mins = Math.floor(eta / 60);
+                                let secs = Math.floor(eta % 60);
+                                etaString = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+                            }
                         }
+
+                        // UPDATE UI TEXT: Menampilkan estimasi sederhana dan update nama (jika berpindah file)
+                        if (fileNameText) fileNameText.innerText = customName;
+                        sText.innerHTML = `${prefix}Estimasi selesai: <b style="color:var(--primary);">${etaString}</b>`;
+                    }, targetWorker);
+                    chunkErr = null;
+                    break; // sukses, keluar dari loop retry chunk ini
+                } catch (e) {
+                    chunkErr = e;
+                    if (attempt < CHUNK_MAX_ATTEMPTS - 1 && !isUploadCancelled) {
+                        // Backoff bertahap (0.6s, 1.2s, 1.8s, ...) supaya kalau
+                        // penyebabnya server lagi sibuk/limit sesaat, dikasih
+                        // waktu pulih dulu sebelum dicoba lagi.
+                        await sleep(600 * (attempt + 1));
                     }
-                    
-                    // UPDATE UI TEXT: Menampilkan estimasi sederhana dan update nama (jika berpindah file)
-                    if (fileNameText) fileNameText.innerText = customName;
-                    sText.innerHTML = `${prefix}Estimasi selesai: <b style="color:var(--primary);">${etaString}</b>`;
-                }); 
-                uploadedChunks.push({ part: i + 1, telegramFileId: tg.result.document.file_id }); 
-                bytesSoFar += chunkBlob.size; 
+                }
             }
-            catch (e) { 
-                isUploadCancelled = true; 
+
+            if (chunkErr) {
+                isUploadCancelled = true;
                 uploadFailed = true;
-                lastUploadFailureMessage = e.message; // FIX: simpan alasan asli, jangan ketutup pesan "dibatalkan" generik di bawah
-                sText.innerHTML = `<span style="color:var(--danger);"><span class="material-symbols-rounded" style="vertical-align:middle; font-size:18px;">error</span> Gagal: ${e.message}. Proses dihentikan.</span>`;
-                showToast(`Upload gagal dan dihentikan: ${e.message}`, true);
-                break; 
+                lastUploadFailureMessage = chunkErr.message; // FIX: simpan alasan asli, jangan ketutup pesan "dibatalkan" generik di bawah
+                sText.innerHTML = `<span style="color:var(--danger);"><span class="material-symbols-rounded" style="vertical-align:middle; font-size:18px;">error</span> Gagal (chunk ${i + 1}/${totalChunks} sudah dicoba ke semua server): ${chunkErr.message}. Proses dihentikan.</span>`;
+                showToast(`Upload gagal dan dihentikan: ${chunkErr.message}`, true);
+                break;
             }
+
+            uploadedChunks.push({ part: i + 1, telegramFileId: chunkResult.result.document.file_id });
+            bytesSoFar += chunkBlob.size;
         }
 
         if (isUploadCancelled || uploadFailed) break; 
@@ -3189,7 +3238,22 @@ async function handleSharedLink(code) {
     sharedViewerUid = activeAcc ? activeAcc.ownerId : '';
     sharedIsOwnerView = false;
 
+    // FIX: pemuatan PERTAMA kali link share dibuka juga bisa kena race gviz
+    // yang sama seperti di polling (lihat catatan panjang di startSharedPolling
+    // di atas) -- misalnya link dibuka persis beberapa detik setelah pemiliknya
+    // rename folder/ubah privasi di HP lain. Beda dengan polling (yang jalan
+    // terus tiap detik dan sudah punya toleransi sendiri), ini cuma 1x
+    // kesempatan -- jadi dikasih retry singkat dulu di sini sebelum benar2
+    // dianggap gagal, supaya "loading pertama" gak langsung nyasar ke 404.
     let res = await getSharedDataFromSheets(code, sharedViewerUid);
+    // Retry HANYA kalau hasilnya gagal TOTAL (null atau res.success falsy --
+    // termasuk res.deleted:true, yang paling sering kena race gviz). Kalau
+    // res.success === true tapi res.authorized === false, itu kasus VALID
+    // (privacy private/restricted beneran) -- jangan di-retry, langsung proses.
+    for (let retry = 0; retry < 3 && (!res || !res.success); retry++) {
+        await sleep(700 * (retry + 1));
+        res = await getSharedDataFromSheets(code, sharedViewerUid);
+    }
     pendingShareResolved = res;
 
     if (!res) { stopSharedPolling(); renderShare404(); updateSharedViewChrome(); return; }
@@ -3429,9 +3493,27 @@ function hideSharedUploadFab() {
     if (fab) fab.style.display = 'none';
 }
 
+// FIX BUG "404 PALSU SAAT RENAME/UBAH DATA" (lanjutan dari getSharedDataFromSheets):
+// gviz (Google Sheets) punya cache internal di sisi Google yang bisa basi sampai
+// puluhan detik SETELAH ada tulisan baru (rename folder, ubah privasi, dst), dan
+// beberapa sheet (DB_03/DB_05/DB_01) dibaca lewat request gviz TERPISAH yang
+// masing-masing punya cache sendiri-sendiri -- jadi ada window waktu singkat di
+// mana kombinasi datanya "kelihatan" tidak konsisten (row share ada tapi row
+// foldernya belum ke-update, dst) walau linknya sendiri sebenarnya valid.
+// Sebelumnya: 1x tick polling dapat hasil "gagal/dihapus/tidak authorized" ->
+// LANGSUNG stopSharedPolling() + tampilkan 404/auth-wall permanen, padahal
+// itu cuma race gviz sesaat -- makanya di gambar sebelumnya user harus
+// refresh manual biar datanya balik normal. Sekarang: dibutuhkan beberapa
+// kali GAGAL BERTURUT-TURUT dulu (SHARED_FAIL_THRESHOLD tick, @1 detik/tick)
+// sebelum benar-benar divonis 404/tidak authorized -- kalau di antaranya ada
+// 1x sukses, hitungannya direset ke 0 lagi.
+let sharedPollFailStreak = 0;
+const SHARED_FAIL_THRESHOLD = 5; // ~5 detik gagal beruntun -- di atas rentang wajar lag cache gviz
+
 function startSharedPolling(code) {
     stopSharedPolling();
     sharedDataSignature = null;
+    sharedPollFailStreak = 0;
     
     sharedPollTimer = setInterval(async () => {
         if (pendingShareCode !== code || document.getElementById('shared-view').style.display === 'none') { stopSharedPolling(); return; }
@@ -3452,6 +3534,8 @@ function startSharedPolling(code) {
         
         // JIKA FILE DIHAPUS / PINDAH KE SAMPAH
         if (!res || !res.success || res.deleted) { 
+            sharedPollFailStreak++;
+            if (sharedPollFailStreak < SHARED_FAIL_THRESHOLD) return; // masih mungkin race gviz -- coba lagi tick berikutnya, jangan langsung vonis
             stopSharedPolling(); 
             closePreviewModal(); 
             hideSharedUploadFab();
@@ -3474,6 +3558,8 @@ function startSharedPolling(code) {
         // di tengah jalan kalau pemilik mengubah pengaturan berbagi saat viewer
         // masih membuka halamannya).
         if (!res.authorized) { 
+            sharedPollFailStreak++;
+            if (sharedPollFailStreak < SHARED_FAIL_THRESHOLD) return; // sama -- beri toleransi lag gviz dulu
             stopSharedPolling(); 
             closePreviewModal(); 
             hideSharedUploadFab();
@@ -3491,6 +3577,7 @@ function startSharedPolling(code) {
             return; 
         }
 
+        sharedPollFailStreak = 0; // sukses -> reset hitungan gagal beruntun
         pendingShareResolved = Object.assign({}, pendingShareResolved, res);
 
         // Update peran (view/edit) tiap detik walau isi folder tidak berubah,
