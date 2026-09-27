@@ -239,6 +239,11 @@ let moveTargetMode = '';
 let clipboardItem = null; // { type: 'file'|'folder', id/path, label }
 let uploadQueue = [];
 let uploadQueueSeq = 0; // ID unik tiap item antrian (qid) -- dipakai untuk update kartu progress per-file
+// Snapshot stabil dari file yang sedang benar-benar diproses worker pool saat
+// upload jalan (lihat startMultiUpload). Dipakai HANYA untuk menghitung total
+// aggregate progress -- terpisah dari uploadQueue supaya penghapusan otomatis
+// file yang sudah "Selesai" (scheduleRemoveQueueItem) tidak bikin total salah.
+let uploadDispatchList = [];
 let activeUploadXhrs = new Set(); // FIX: dulu cuma 1 xhr aktif (currentActiveXhr) karena upload sekuensial;
                                   // sekarang beberapa file bisa upload BERSAMAAN jadi butuh Set biar
                                   // tombol batal (closeUploadModal) bisa abort SEMUA xhr yang lagi jalan.
@@ -577,6 +582,18 @@ async function switchAccount(acc) {
         stateArray = { active: [], trash: [], folders: [] };
         selectedFileIds.clear(); selectedFolderPaths.clear();
         lastDataSignature = null;
+        // FIX: dulu currentTab/currentPath dibiarkan APA ADANYA saat pindah
+        // akun -- kalau sebelumnya sedang berada di dalam sebuah folder,
+        // path folder itu (milik akun LAMA) ikut kebawa ke akun baru. Karena
+        // folder dengan path itu hampir pasti tidak ada di akun baru, hasilnya
+        // tampilan "nyangkut" kosong di lokasi yang tidak pernah ada. Sekarang
+        // dipaksa reset ke Beranda (root) setiap kali pindah akun.
+        currentTab = 'home'; currentPath = '';
+        document.getElementById('search-input').value = '';
+        ['home', 'files', 'folders', 'trash'].forEach(t => {
+            const sb = document.getElementById('nav-' + t); if (sb) sb.className = t === 'home' ? 'nav-item active' : 'nav-item';
+            const bn = document.getElementById('bnav-' + t); if (bn) bn.className = t === 'home' ? 'bottom-nav-item active' : 'bottom-nav-item';
+        });
         renderUI();
         document.getElementById('login-view').style.display = 'none';
         document.getElementById('app-layout').style.display = 'flex';
@@ -1280,6 +1297,13 @@ function navigateToFolder(path) {
         const sb = document.getElementById('nav-' + t); if (sb) sb.className = t === 'home' ? 'nav-item active' : 'nav-item';
         const bn = document.getElementById('bnav-' + t); if (bn) bn.className = t === 'home' ? 'bottom-nav-item active' : 'bottom-nav-item';
     });
+    // FIX: beda dengan switchTab(), fungsi ini dulu TIDAK menutup drawer
+    // sidebar mobile (hamburger menu) -- kalau navigasi ini dipicu saat
+    // sidebar itu sedang terbuka (mis. dari alur redirectOwnerToDrive di HP),
+    // overlay sidebar+backdrop bisa ketinggalan menutupi layar termasuk
+    // bottom-nav, membuatnya terlihat "hilang"/nge-bug di HP.
+    document.getElementById('app-sidebar').classList.remove('open');
+    document.getElementById('sidebar-backdrop').classList.remove('open');
     renderUI();
 }
 
@@ -2573,7 +2597,7 @@ function handleThumbLoadError(imgEl, containerId, iconName) {
 // ==========================================
 // UPLOAD MULTI-FILE SYSTEM
 // ==========================================
-function openUploadModal() { isUploadCancelled = false; uploadQueue = []; renderUploadQueue(); document.getElementById('upload-modal').style.display = 'flex'; }
+function openUploadModal() { isUploadCancelled = false; uploadQueue = []; uploadDispatchList = []; renderUploadQueue(); document.getElementById('upload-modal').style.display = 'flex'; }
 function closeUploadModal() {
     isUploadCancelled = true;
     // Batalkan SEMUA upload yang sedang berjalan bersamaan (bukan cuma 1 xhr seperti dulu).
@@ -2583,6 +2607,7 @@ function closeUploadModal() {
     document.getElementById('upload-modal').style.display = 'none';
     uploadQueue.forEach(it => { if (it.previewUrl) URL.revokeObjectURL(it.previewUrl); });
     uploadQueue = [];
+    uploadDispatchList = [];
     sharedUploadActive = false;
 }
 
@@ -2606,9 +2631,13 @@ function handleMultiFileSelect(input) {
         const pureName = lastDot !== -1 ? rawName.substring(0, lastDot) : rawName;
         const item = {
             qid: ++uploadQueueSeq, file: file, customName: pureName, ext: ext,
-            status: 'queued',       // queued -> uploading -> done | error
+            // selected  = baru dipilih, belum ditekan tombol Upload (masih bisa dihapus/rename)
+            // queued    = sudah ditekan Upload, masih menunggu giliran slot worker kosong
+            // uploading -> done | error | cancelled
+            status: 'selected',
             progressPercent: 0, loadedBytes: 0, statusText: '',
-            previewUrl: null, thumbBlob: null
+            previewUrl: null, thumbBlob: null,
+            cancelRequested: false, activeXhr: null, thumbAbortController: null
         };
         uploadQueue.push(item);
         prepareQueueItemPreview(item);
@@ -2642,9 +2671,72 @@ function prepareQueueItemPreview(item) {
 function updateQueueName(index, newName) { if (uploadQueue[index]) uploadQueue[index].customName = newName; }
 function removeFromQueue(index) {
     const item = uploadQueue[index];
-    if (item && item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+    if (!item || item.status !== 'selected') return; // sudah ditekan Upload -- tidak boleh dihapus lagi
+    if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
     uploadQueue.splice(index, 1);
     renderUploadQueue();
+}
+
+// Batalkan 1 file tertentu (baik yang masih "menunggu giliran" maupun yang
+// sedang aktif diupload) TANPA menghentikan file lain yang berjalan bersamaan.
+function cancelQueueItem(index) {
+    const item = uploadQueue[index];
+    if (!item || (item.status !== 'queued' && item.status !== 'uploading')) return;
+    item.cancelRequested = true;
+    if (item.activeXhr) { try { item.activeXhr.abort(); } catch (e) {} }
+    if (item.thumbAbortController) { try { item.thumbAbortController.abort(); } catch (e) {} }
+    item.status = 'cancelled';
+    item.statusText = 'Dibatalkan';
+    renderUploadQueue();
+    updateAggregateUploadUI();
+}
+
+// Ulangi upload untuk 1 file yang gagal/dibatalkan -- jalan independen, tidak
+// perlu menekan tombol Upload utama lagi ataupun mengganggu file lain.
+function retryQueueItem(index) {
+    const item = uploadQueue[index];
+    if (!item || (item.status !== 'error' && item.status !== 'cancelled')) return;
+    item.cancelRequested = false;
+    item.activeXhr = null; item.thumbAbortController = null;
+    item.progressPercent = 0; item.loadedBytes = 0; item.statusText = '';
+    item.status = 'uploading';
+    renderUploadQueue();
+    runSingleItemUpload(item);
+}
+
+async function runSingleItemUpload(item) {
+    let ok = false;
+    try { ok = await processQueueItem(item, 1, 1); }
+    catch (e) { ok = false; item.statusText = (e && e.message) || 'Gagal.'; }
+    if (item.status !== 'cancelled') item.status = ok ? 'done' : 'error';
+    renderUploadQueue();
+    updateAggregateUploadUI();
+    if (ok) scheduleRemoveQueueItem(item.qid);
+}
+
+// FIX UI: file yang sudah selesai diupload otomatis hilang dari daftar 1 detik
+// kemudian, dengan animasi fade+collapse yang smooth (lihat .uq-card-removing
+// di style.css), bukan langsung dihapus tiba-tiba.
+function scheduleRemoveQueueItem(qid) {
+    setTimeout(() => {
+        const stillThere = uploadQueue.some(it => it.qid === qid);
+        if (!stillThere) return;
+        const cardEl = document.getElementById(`upload-queue-card-${qid}`);
+        const finalize = () => {
+            const idx = uploadQueue.findIndex(it => it.qid === qid);
+            if (idx !== -1) {
+                if (uploadQueue[idx].previewUrl) URL.revokeObjectURL(uploadQueue[idx].previewUrl);
+                uploadQueue.splice(idx, 1);
+            }
+            renderUploadQueue();
+        };
+        if (cardEl) {
+            cardEl.classList.add('uq-card-removing');
+            setTimeout(finalize, 320);
+        } else {
+            finalize();
+        }
+    }, 1000);
 }
 
 // Update murah (tanpa re-render seluruh list) yang dipanggil berkali-kali per
@@ -2666,18 +2758,22 @@ function updateAggregateUploadUI() {
     const percentEl = document.getElementById('upload-percentage');
     const fileNameText = document.getElementById('upload-filename');
     if (!progressBar && !percentEl && !fileNameText) return;
+    // Pakai snapshot dispatch list kalau sedang ada upload batch jalan, supaya
+    // total tidak berubah-ubah gara-gara file "Selesai" otomatis menghilang
+    // dari uploadQueue (lihat scheduleRemoveQueueItem).
+    const refList = uploadDispatchList.length > 0 ? uploadDispatchList : uploadQueue;
     let totalBytes = 0, loadedBytes = 0, doneCount = 0, errorCount = 0, uploadingCount = 0;
-    uploadQueue.forEach(it => {
+    refList.forEach(it => {
         const size = it.file ? it.file.size : 0;
         totalBytes += size;
         if (it.status === 'done') { loadedBytes += size; doneCount++; }
-        else if (it.status === 'error') { errorCount++; }
+        else if (it.status === 'error' || it.status === 'cancelled') { errorCount++; }
         else if (it.status === 'uploading') { uploadingCount++; loadedBytes += (it.loadedBytes || 0); }
     });
     const percent = totalBytes > 0 ? Math.min(100, (loadedBytes / totalBytes) * 100).toFixed(1) : 0;
     if (progressBar) progressBar.style.width = percent + '%';
     if (percentEl) percentEl.innerText = percent + '%';
-    if (fileNameText) fileNameText.innerText = `${doneCount}/${uploadQueue.length} selesai${errorCount ? ', ' + errorCount + ' gagal' : ''}`;
+    if (fileNameText) fileNameText.innerText = `${doneCount}/${refList.length} selesai${errorCount ? ', ' + errorCount + ' gagal/dibatalkan' : ''}`;
 }
 
 function renderUploadQueue() {
@@ -2691,19 +2787,25 @@ function renderUploadQueue() {
             : `<span class="material-symbols-rounded">${iconName}</span>`;
 
         let statusHTML;
-        if (qItem.status === 'done') {
+        if (qItem.status === 'selected') {
+            // Belum ditekan Upload -- jangan tampilkan status "antrean" apa pun,
+            // cukup thumbnail + nama + format + ukuran (lihat card di bawah).
+            statusHTML = '';
+        } else if (qItem.status === 'done') {
             statusHTML = `<div class="uq-status uq-status-done"><span class="material-symbols-rounded" style="font-size:15px;">check_circle</span> Selesai</div>`;
         } else if (qItem.status === 'error') {
             statusHTML = `<div class="uq-status uq-status-error"><span class="material-symbols-rounded" style="font-size:15px;">error</span> ${escapeHtml(qItem.statusText || 'Gagal')}</div>`;
+        } else if (qItem.status === 'cancelled') {
+            statusHTML = `<div class="uq-status uq-status-cancelled"><span class="material-symbols-rounded" style="font-size:15px;">cancel</span> Dibatalkan</div>`;
         } else if (qItem.status === 'uploading') {
             statusHTML = `
                 <div class="progress-track" style="height:5px; margin-top:6px;"><div class="progress-fill is-uploading" id="uq-bar-${qItem.qid}" style="width:${qItem.progressPercent || 0}%;"></div></div>
                 <div class="uq-status" id="uq-text-${qItem.qid}" style="margin-top:3px;">${escapeHtml(qItem.statusText || 'Mengunggah...')}</div>`;
-        } else {
+        } else { // 'queued' -- sudah ditekan Upload, masih menunggu slot worker kosong
             statusHTML = `<div class="uq-status uq-status-queued"><span class="material-symbols-rounded" style="font-size:15px;">schedule</span> Menunggu giliran</div>`;
         }
 
-        const canEditName = qItem.status === 'queued';
+        const canEditName = qItem.status === 'selected';
         const nameField = canEditName
             ? `<div class="inline-input-group" style="margin-bottom:0;">
                    <input type="text" value="${escapeHtml(qItem.customName)}" oninput="updateQueueName(${index}, this.value)" placeholder="Nama berkas...">
@@ -2711,13 +2813,22 @@ function renderUploadQueue() {
                </div>`
             : `<div class="uq-name">${escapeHtml(qItem.customName + (qItem.ext ? '.' + qItem.ext : ''))}</div>`;
 
+        // FIX UI: satu status "selesai" saja (baris teks + ikon di bawah nama),
+        // jadi TIDAK ada lagi ikon centang duplikat di sisi kanan kartu.
         let actionHTML;
-        if (qItem.status === 'uploading') actionHTML = ''; // lagi jalan -- batal per-file lewat tombol batal semua (close modal)
-        else if (qItem.status === 'done') actionHTML = `<span class="material-symbols-rounded" style="color:var(--primary);font-size:20px;">check_circle</span>`;
-        else actionHTML = `<button class="icon-btn" style="color:var(--danger); padding:8px; background:var(--danger-light); border-radius:var(--radius-sm); flex-shrink:0;" onclick="removeFromQueue(${index})" title="Hapus"><span class="material-symbols-rounded" style="font-size:18px;">delete</span></button>`;
+        if (qItem.status === 'selected') {
+            actionHTML = `<button class="icon-btn" style="color:var(--danger); padding:8px; background:var(--danger-light); border-radius:var(--radius-sm); flex-shrink:0;" onclick="removeFromQueue(${index})" title="Hapus"><span class="material-symbols-rounded" style="font-size:18px;">delete</span></button>`;
+        } else if (qItem.status === 'queued' || qItem.status === 'uploading') {
+            actionHTML = `<button class="icon-btn" style="color:var(--text-muted); padding:8px; border-radius:var(--radius-sm); flex-shrink:0;" onclick="cancelQueueItem(${index})" title="Batalkan"><span class="material-symbols-rounded" style="font-size:18px;">close</span></button>`;
+        } else if (qItem.status === 'error' || qItem.status === 'cancelled') {
+            actionHTML = `<button class="icon-btn" style="color:var(--primary); padding:8px; background:var(--primary-light,rgba(52,211,153,0.12)); border-radius:var(--radius-sm); flex-shrink:0;" onclick="retryQueueItem(${index})" title="Ulangi"><span class="material-symbols-rounded" style="font-size:18px;">refresh</span></button>`;
+        } else { // 'done'
+            actionHTML = '';
+        }
 
+        const cardClass = 'upload-queue-card' + (qItem.status === 'cancelled' ? ' uq-cancelled' : '');
         htmlContent += `
-            <div class="upload-queue-card">
+            <div class="${cardClass}" id="upload-queue-card-${qItem.qid}">
                 <div class="upload-queue-thumb">${thumbInner}</div>
                 <div class="upload-queue-info">
                     ${nameField}
@@ -2735,10 +2846,11 @@ function renderUploadQueue() {
 // jika event asli ternyata tidak muncul lagi (umum terjadi di sebagian WebView HP).
 let lastKnownUploadSpeedBps = 0;
 
-function uploadChunkXHR(formData, startBytes, totalFileSize, onProgress, forceWorker) {
+function uploadChunkXHR(formData, startBytes, totalFileSize, onProgress, forceWorker, item) {
     return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         activeUploadXhrs.add(xhr);
+        if (item) item.activeXhr = xhr; // dipakai tombol Batalkan per-file untuk abort xhr ini
         
         // PATCH: sebelumnya SELALU acak (getRandomWorker()), jadi kalau chunk ini
         // sedang di-retry gara-gara worker pertama gagal, ada kemungkinan (1/N)
@@ -2797,6 +2909,7 @@ function uploadChunkXHR(formData, startBytes, totalFileSize, onProgress, forceWo
             // non-empty" atau semacamnya). Sekarang badan responsnya ikut dibaca
             // dan ditampilkan, biar pesan errornya kelihatan penyebab pastinya --
             // bukan cuma kode status doang.
+            if (item && item.activeXhr === xhr) item.activeXhr = null;
             if (xhr.status !== 200) {
                 let detail = '';
                 try {
@@ -2813,8 +2926,8 @@ function uploadChunkXHR(formData, startBytes, totalFileSize, onProgress, forceWo
             } catch (e) { reject(e); } 
         };
         
-        xhr.onerror = () => { clearInterval(fallbackTimer); activeUploadXhrs.delete(xhr); reject(new Error('Koneksi terputus saat mengunggah')); };
-        xhr.onabort = () => { clearInterval(fallbackTimer); activeUploadXhrs.delete(xhr); reject(new Error('Upload dibatalkan.')); };
+        xhr.onerror = () => { clearInterval(fallbackTimer); activeUploadXhrs.delete(xhr); if (item && item.activeXhr === xhr) item.activeXhr = null; reject(new Error('Koneksi terputus saat mengunggah')); };
+        xhr.onabort = () => { clearInterval(fallbackTimer); activeUploadXhrs.delete(xhr); if (item && item.activeXhr === xhr) item.activeXhr = null; reject(new Error('Upload dibatalkan.')); };
         
         xhr.send(formData);
     });
@@ -2915,15 +3028,24 @@ async function startMultiUpload() {
     // PATCH: DETEKSI FILE 0 BYTE SEBELUM DIKIRIM -- dulu dicek di tengah
     // while-loop sekuensial; sekarang semua file jalan berbarengan jadi
     // validasi ini harus selesai duluan, sebelum satu pun worker dimulai.
+    // Hanya berlaku untuk file yang BELUM pernah dicoba ('selected') --
+    // file yang sudah done/error/cancelled/queued dibiarkan apa adanya.
     for (let i = uploadQueue.length - 1; i >= 0; i--) {
-        const f = uploadQueue[i].file;
+        const it = uploadQueue[i];
+        if (it.status !== 'selected') continue;
+        const f = it.file;
         if (!f || f.size === 0) {
-            showToast(`${uploadQueue[i].customName}: file 0 byte / belum sepenuhnya terunduh (biasanya file iCloud/Files yang belum dibuka). Buka dulu filenya di app Files/Photos sampai terlihat penuh, lalu upload ulang.`, true);
-            if (uploadQueue[i].previewUrl) URL.revokeObjectURL(uploadQueue[i].previewUrl);
+            showToast(`${it.customName}: file 0 byte / belum sepenuhnya terunduh (biasanya file iCloud/Files yang belum dibuka). Buka dulu filenya di app Files/Photos sampai terlihat penuh, lalu upload ulang.`, true);
+            if (it.previewUrl) URL.revokeObjectURL(it.previewUrl);
             uploadQueue.splice(i, 1);
         }
     }
-    if (uploadQueue.length === 0) return;
+    // Antrean pengiriman: HANYA file yang baru dipilih & belum pernah dicoba.
+    // Dipakai sebagai snapshot stabil untuk worker pool -- terpisah dari
+    // uploadQueue (yang dipakai buat render & bisa menyusut duluan begitu
+    // ada file yang selesai & menghilang -- lihat scheduleRemoveQueueItem).
+    const dispatchList = uploadQueue.filter(it => it.status === 'selected');
+    if (dispatchList.length === 0) return;
 
     isUploadInProgress = true;
     isUploadCancelled = false;
@@ -2934,11 +3056,15 @@ async function startMultiUpload() {
     const box = document.getElementById('upload-progress-box');
     box.style.display = 'block';
 
-    uploadQueue.forEach(it => { it.status = 'queued'; it.progressPercent = 0; it.loadedBytes = 0; it.statusText = ''; });
+    dispatchList.forEach(it => {
+        it.status = 'queued'; it.progressPercent = 0; it.loadedBytes = 0; it.statusText = '';
+        it.cancelRequested = false; it.activeXhr = null; it.thumbAbortController = null;
+    });
+    uploadDispatchList = dispatchList;
     renderUploadQueue();
     updateAggregateUploadUI();
 
-    const totalFiles = uploadQueue.length;
+    const totalFiles = dispatchList.length;
     let successCount = 0;
     let nextIndex = 0;
 
@@ -2946,24 +3072,28 @@ async function startMultiUpload() {
         while (true) {
             if (isUploadCancelled) return;
             const myIndex = nextIndex++;
-            if (myIndex >= uploadQueue.length) return;
-            const item = uploadQueue[myIndex];
+            if (myIndex >= dispatchList.length) return;
+            const item = dispatchList[myIndex];
+            // Sudah dibatalkan sebelum sempat giliran diproses -- lewati saja.
+            if (item.status === 'cancelled' || item.cancelRequested) continue;
             item.status = 'uploading';
             renderUploadQueue();
             let ok = false;
             try { ok = await processQueueItem(item, myIndex + 1, totalFiles); }
             catch (e) { ok = false; item.statusText = (e && e.message) || 'Gagal.'; }
-            item.status = ok ? 'done' : 'error';
+            if (item.status !== 'cancelled') item.status = ok ? 'done' : 'error';
             if (ok) successCount++;
             renderUploadQueue();
             updateAggregateUploadUI();
+            if (ok) scheduleRemoveQueueItem(item.qid);
         }
     }
 
-    const workerCount = Math.min(MAX_CONCURRENT_UPLOADS, uploadQueue.length);
+    const workerCount = Math.min(MAX_CONCURRENT_UPLOADS, dispatchList.length);
     const runners = [];
     for (let w = 0; w < workerCount; w++) runners.push(worker());
     await Promise.all(runners);
+    uploadDispatchList = [];
 
     if (isUploadCancelled) {
         showToast(lastUploadFailureMessage ? `Upload berhenti: ${lastUploadFailureMessage}` : "Proses upload dibatalkan.", true);
@@ -2974,7 +3104,7 @@ async function startMultiUpload() {
         const failCount = totalFiles - successCount;
         const sText = document.getElementById('upload-status-text');
         sText.innerHTML = failCount > 0
-            ? `Selesai! <b>${successCount} dari ${totalFiles}</b> berkas berhasil, ${failCount} gagal.`
+            ? `Selesai! <b>${successCount} dari ${totalFiles}</b> berkas berhasil, ${failCount} gagal/dibatalkan.`
             : `Selesai! <b>${successCount} dari ${totalFiles}</b> berkas berhasil diunggah.`;
         if (sharedUploadActive) {
             if (!sharedIsSelecting) renderSharedFolderBody({ item: { name: sharedCurrentFolderName, contents: sharedContentsCache }, ownerId: pendingShareResolved && pendingShareResolved.ownerId, ownerName: pendingShareResolved && pendingShareResolved.ownerName, role: sharedUploadFabRole }, sharedUploadShareId, sharedViewerUid, sharedCurrentPath);
@@ -2982,7 +3112,15 @@ async function startMultiUpload() {
             renderUI();
             await syncData();
         }
-        setTimeout(() => { closeUploadModal(); box.style.display = 'none'; btn.disabled = false; uploadQueue = []; isUploadInProgress = false; }, 1400);
+        btn.disabled = false; isUploadInProgress = false;
+        if (failCount > 0) {
+            // Ada file gagal/dibatalkan -- modal TETAP terbuka supaya pengguna
+            // bisa menekan tombol "Ulangi" per file (lihat retryQueueItem),
+            // bukan langsung ditutup & dibuang begitu saja.
+            renderUploadQueue();
+        } else {
+            setTimeout(() => { closeUploadModal(); box.style.display = 'none'; uploadQueue = []; }, 1400);
+        }
     }
 }
 
@@ -3019,7 +3157,7 @@ async function processQueueItem(item, currentIdx, totalFiles) {
         // -- tidak perlu capture frame video 2x untuk hal yang identik.
         let thumbBlob = item.thumbBlob || await generateVideoThumbnail(fileInput);
 
-        if (isUploadCancelled) return false;
+        if (isUploadCancelled || item.cancelRequested) return false;
 
         if (thumbBlob) {
             const fdThumb = new FormData();
@@ -3028,13 +3166,15 @@ async function processQueueItem(item, currentIdx, totalFiles) {
 
             const activeWorker = getRandomWorker();
             const uploadUrl = `${activeWorker}/upload?token=${WORKER_PASSWORD}&bot_token=${TELEGRAM_BOT_TOKEN}`;
+            item.thumbAbortController = new AbortController();
             try {
-                const tRes = await fetch(uploadUrl, { method: 'POST', body: fdThumb }).then(r => r.json());
+                const tRes = await fetch(uploadUrl, { method: 'POST', body: fdThumb, signal: item.thumbAbortController.signal }).then(r => r.json());
                 if (tRes.ok) {
                     if (tRes.result.document) thumbTelegramId = tRes.result.document.file_id;
                     else if (tRes.result.sticker) thumbTelegramId = tRes.result.sticker.file_id;
                 }
             } catch (e) { console.error("Gagal upload thumb", e); }
+            item.thumbAbortController = null;
         }
     }
     // =====================================
@@ -3077,17 +3217,19 @@ async function processQueueItem(item, currentIdx, totalFiles) {
 
             const activeWorker = getRandomWorker();
             const uploadUrl = `${activeWorker}/upload?token=${WORKER_PASSWORD}&bot_token=${TELEGRAM_BOT_TOKEN}`;
+            item.thumbAbortController = new AbortController();
             try {
-                const tRes = await fetch(uploadUrl, { method: 'POST', body: fdThumb }).then(r => r.json());
+                const tRes = await fetch(uploadUrl, { method: 'POST', body: fdThumb, signal: item.thumbAbortController.signal }).then(r => r.json());
                 if (tRes.ok) {
                     if (tRes.result.document) thumbTelegramId = tRes.result.document.file_id;
                     else if (tRes.result.sticker) thumbTelegramId = tRes.result.sticker.file_id;
                 }
             } catch (e) { console.error("Gagal upload thumb", e); }
+            item.thumbAbortController = null;
         }
     }
 
-    if (isUploadCancelled) return false;
+    if (isUploadCancelled || item.cancelRequested) return false;
 
     setStatusText(`${prefix}Memulai upload...`);
     const totalChunks = Math.ceil(fileInput.size / CHUNK_SIZE);
@@ -3102,7 +3244,7 @@ async function processQueueItem(item, currentIdx, totalFiles) {
     // ==========================================
     const CHUNK_MAX_ATTEMPTS = Math.max(3, WORKER_POOL.length * 2);
     for (let i = 0; i < totalChunks; i++) {
-        if (isUploadCancelled || itemCancelled) break;
+        if (isUploadCancelled || itemCancelled || item.cancelRequested) break;
         let chunkBlob = fileInput.slice(i * CHUNK_SIZE, Math.min((i + 1) * CHUNK_SIZE, fileInput.size));
 
         // PATCH: WORKAROUND BUG SAFARI/WEBKIT (lihat penjelasan versi lama) --
@@ -3126,7 +3268,7 @@ async function processQueueItem(item, currentIdx, totalFiles) {
         let chunkResult = null;
         let chunkErr = null;
         for (let attempt = 0; attempt < CHUNK_MAX_ATTEMPTS; attempt++) {
-            if (isUploadCancelled || itemCancelled) break;
+            if (isUploadCancelled || itemCancelled || item.cancelRequested) break;
             // FormData harus dibuat baru tiap percobaan -- lihat catatan versi lama.
             const fd = new FormData();
             fd.append('chat_id', TELEGRAM_CHAT_ID);
@@ -3159,12 +3301,12 @@ async function processQueueItem(item, currentIdx, totalFiles) {
                     }
                     updateQueueItemProgress(item.qid, percent, `${prefix}${percent}% • ETA ${etaString}`);
                     updateAggregateUploadUI();
-                }, targetWorker);
+                }, targetWorker, item);
                 chunkErr = null;
                 break; // sukses, keluar dari loop retry chunk ini
             } catch (e) {
                 chunkErr = e;
-                if (attempt < CHUNK_MAX_ATTEMPTS - 1 && !isUploadCancelled && !itemCancelled) {
+                if (attempt < CHUNK_MAX_ATTEMPTS - 1 && !isUploadCancelled && !itemCancelled && !item.cancelRequested) {
                     await sleep(600 * (attempt + 1));
                 }
             }
@@ -3172,9 +3314,14 @@ async function processQueueItem(item, currentIdx, totalFiles) {
 
         if (chunkErr) {
             itemCancelled = true;
-            item.statusText = `Gagal (chunk ${i + 1}/${totalChunks}, sudah dicoba semua server): ${chunkErr.message}`;
-            setStatusText(item.statusText);
-            showToast(`${customName}: upload gagal dan dihentikan (${chunkErr.message})`, true);
+            // Kalau ini akibat pengguna sendiri menekan tombol Batalkan, status
+            // & pesannya sudah diset duluan oleh cancelQueueItem() ("Dibatalkan")
+            // -- jangan ditimpa jadi pesan error teknis + jangan munculkan toast.
+            if (!item.cancelRequested) {
+                item.statusText = `Gagal (chunk ${i + 1}/${totalChunks}, sudah dicoba semua server): ${chunkErr.message}`;
+                setStatusText(item.statusText);
+                showToast(`${customName}: upload gagal dan dihentikan (${chunkErr.message})`, true);
+            }
             break;
         }
 
@@ -3184,6 +3331,7 @@ async function processQueueItem(item, currentIdx, totalFiles) {
 
     if (isUploadCancelled) return false;
     if (itemCancelled) return false;
+    if (item.cancelRequested) return false;
 
     setStatusText(`${prefix}Menyimpan metadata...`);
     let metaRes;
@@ -3663,6 +3811,12 @@ async function redirectOwnerToDrive(ownerAccount, res) {
     document.getElementById('shared-view').style.display = 'none';
     document.getElementById('login-view').style.display = 'none';
     document.getElementById('app-layout').style.display = 'flex';
+    // FIX (HP): pastikan drawer sidebar mobile & backdrop-nya tidak ketinggalan
+    // dalam kondisi "terbuka" saat beralih dari halaman share ke drive sendiri --
+    // kalau ketinggalan, overlay itu bisa menutupi bottom-nav dan membuatnya
+    // terlihat hilang/nge-bug begitu mendarat di layar HP.
+    document.getElementById('app-sidebar').classList.remove('open');
+    document.getElementById('sidebar-backdrop').classList.remove('open');
 
     window.history.replaceState({}, document.title, location.origin + location.pathname);
 
@@ -4771,24 +4925,44 @@ async function drawAudioWave(container, audioUrl) {
         const response = await fetch(audioUrl);
         const arrayBuffer = await response.arrayBuffer();
         
-        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        // FIX PERFORMA: dulu decodeAudioData() didekode di sample rate ASLI
+        // file (biasanya 44.1kHz/48kHz) padahal cuma dipakai untuk menggambar
+        // 110 batang -- untuk file panjang (misal audio 1 jam), itu berarti
+        // mendekode puluhan JUTA sample cuma buat dibuang lewat rata-rata.
+        // Sekarang AudioContext dipaksa pakai sample rate RENDAH (8kHz, batas
+        // bawah yang didukung semua browser) -- decodeAudioData otomatis
+        // resample ke situ, jadi jumlah sample yang perlu diproses turun
+        // drastis (~5-6x lebih sedikit dari 44.1kHz) tanpa mengubah bentuk
+        // visual waveform-nya sama sekali (toh cuma jadi 110 batang).
+        let audioCtx;
+        try { audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 8000 }); }
+        catch (e) { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } // fallback kalau browser menolak sampleRate custom
         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-        
+        audioCtx.close?.(); // konteksnya cuma dipakai buat decode, tidak perlu tetap hidup
+
         const rawData = audioBuffer.getChannelData(0);
         const samples = 110; 
-        const blockSize = Math.floor(rawData.length / samples);
+        const blockSize = Math.floor(rawData.length / samples) || 1;
+        // FIX PERFORMA #2: dulu loop dalam menjumlah SEMUA sample di tiap blok
+        // (bisa ribuan iterasi/blok). Sekarang cukup "mengintip" lewat stride
+        // maksimal ~250 titik per blok -- cukup representatif untuk digambar
+        // sebagai 1 batang, tapi jauh lebih sedikit iterasi untuk blok besar.
+        const maxPeeksPerBlock = 250;
+        const stride = Math.max(1, Math.floor(blockSize / maxPeeksPerBlock));
         const filteredData = [];
         
         for (let i = 0; i < samples; i++) {
             let blockStart = blockSize * i;
-            let sum = 0;
-            for (let j = 0; j < blockSize; j++) {
-                sum += Math.abs(rawData[blockStart + j]);
+            let blockEnd = Math.min(blockStart + blockSize, rawData.length);
+            let sum = 0, count = 0;
+            for (let j = blockStart; j < blockEnd; j += stride) {
+                sum += Math.abs(rawData[j]);
+                count++;
             }
-            filteredData.push(sum / blockSize);
+            filteredData.push(count > 0 ? sum / count : 0);
         }
 
-        const multiplier = Math.max(...filteredData);
+        const multiplier = Math.max(...filteredData) || 1;
         const normalizedData = filteredData.map(n => n / multiplier);
 
         const drawCanvas = (canvas, color) => {
