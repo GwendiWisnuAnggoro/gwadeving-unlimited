@@ -1187,7 +1187,10 @@ async function realtimePollTick() {
 
         const shared = buildSharedWithMeFromRaw(raw, currentOwnerId);
         const sig2 = JSON.stringify(shared);
-        if (sig2 !== lastSharedSignature) { lastSharedSignature = sig2; sharedWithMeItems = shared; renderSharedWithMeSidebar(); }
+        if (sig2 !== lastSharedSignature) {
+            lastSharedSignature = sig2; sharedWithMeItems = shared;
+            if (currentTab === 'shared') renderSharedWithMeMain(document.getElementById('search-input') ? document.getElementById('search-input').value : '');
+        }
     } catch (e) {
     } finally { realtimePollBusy = false; }
 }
@@ -1288,7 +1291,7 @@ async function syncData() {
 function switchTab(tab) {
     currentTab = tab; currentPath = ''; clearSelection();
     document.getElementById('search-input').value = '';
-    ['home', 'files', 'folders', 'trash'].forEach(t => {
+    ['home', 'files', 'folders', 'trash', 'shared'].forEach(t => {
         const sb = document.getElementById('nav-' + t); if (sb) sb.className = t === tab ? 'nav-item active' : 'nav-item';
         const bn = document.getElementById('bnav-' + t); if (bn) bn.className = t === tab ? 'bottom-nav-item active' : 'bottom-nav-item';
     });
@@ -1299,7 +1302,7 @@ function switchTab(tab) {
 function navigateToFolder(path) {
     currentTab = 'home'; currentPath = path; clearSelection();
     document.getElementById('search-input').value = '';
-    ['home', 'files', 'folders', 'trash'].forEach(t => {
+    ['home', 'files', 'folders', 'trash', 'shared'].forEach(t => {
         const sb = document.getElementById('nav-' + t); if (sb) sb.className = t === 'home' ? 'nav-item active' : 'nav-item';
         const bn = document.getElementById('bnav-' + t); if (bn) bn.className = t === 'home' ? 'bottom-nav-item active' : 'bottom-nav-item';
     });
@@ -1425,6 +1428,9 @@ function renderUI() {
         titleEl.innerText = "Folder"; breadcrumbEl.innerHTML = "";
         document.getElementById('files-section-title').innerText = '';
         renderFolderTabOnly(q);
+    } else if (currentTab === 'shared') {
+        titleEl.innerText = "Dibagikan"; breadcrumbEl.innerHTML = "";
+        document.getElementById('files-section-title').innerText = '';
     } else {
         if (currentPath === '') { titleEl.innerText = "Beranda"; breadcrumbEl.innerHTML = ""; }
         else {
@@ -1445,7 +1451,7 @@ function renderUI() {
         document.getElementById('files-section-title').innerText = 'Berkas';
         renderFoldersAndFiles(q);
     }
-    renderSharedWithMeSidebar();
+    if (currentTab === 'shared') renderSharedWithMeMain(q);
     updateSelectionToolbar();
     updateFabForPaste(); 
 }
@@ -2373,45 +2379,100 @@ async function downloadSelectedFile() {
     } catch (e) { hideLoadingOverlay(); if (e.message !== "Dibatalkan oleh pengguna") showToast("Gagal mengunduh: " + (e.message || 'kesalahan'), true); }
 }
 
+// Nama file ZIP untuk unduhan gabungan: <timestamp>-gwadeving.zip
+function buildTimestampedZipName() {
+    const d = new Date();
+    const pad = n => String(n).padStart(2, '0');
+    const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+    return `${stamp}-gwadeving.zip`;
+}
+
+// PATCH: dulu fungsi ini SAMA SEKALI mengabaikan folder yang ikut dipilih
+// (cuma memproses selectedFileIds) dan setiap file diunduh satu-satu secara
+// terpisah walau yang dipilih banyak. Sekarang: kalau yang dipilih cuma 1
+// (berupa file ATAU folder) tetap diunduh langsung seperti biasa (file
+// langsung, folder jadi ZIP bernama folder itu sendiri). Begitu yang dipilih
+// LEBIH DARI 1 -- baik banyak file, banyak folder, atau campuran -- semuanya
+// digabung jadi SATU file ZIP, dengan isi tiap folder mengikuti struktur
+// path aslinya (diletakkan di dalam sub-folder bernama folder itu sendiri).
 async function downloadOwnSelectedBulk() {
-    const ids = Array.from(selectedFileIds);
-    if (ids.length === 0) return;
-    if (ids.length === 1) {
-        selectedFileForAction = stateArray.active.find(f => f.id === ids[0]);
+    const fileIds = Array.from(selectedFileIds);
+    const folderPaths = Array.from(selectedFolderPaths);
+    const total = fileIds.length + folderPaths.length;
+    if (total === 0) return;
+
+    // Hanya 1 file saja yang dipilih -> unduh langsung (tanpa ZIP), seperti sebelumnya.
+    if (total === 1 && fileIds.length === 1) {
+        selectedFileForAction = stateArray.active.find(f => f.id === fileIds[0]);
         if (selectedFileForAction) await downloadSelectedFile();
         return;
     }
+    // Hanya 1 folder saja yang dipilih -> unduh sebagai ZIP bernama folder itu sendiri.
+    if (total === 1 && folderPaths.length === 1) {
+        selectedFolderForAction = folderPaths[0];
+        await downloadFolderAsZipOwner();
+        return;
+    }
+
+    // Lebih dari 1 item terpilih (file dan/atau folder) -> gabung jadi 1 ZIP.
+    if (!window.JSZip) { showToast("Gagal memuat pustaka ZIP. Periksa koneksi internet Anda.", true); return; }
     sharedDownloadCancelled = false;
     globalAbortController = new AbortController();
-    showLoadingOverlay(`Menyiapkan unduhan (0/${ids.length})...`, true, true);
-    let done = 0, failed = 0;
-    for (const id of ids) {
-        if (sharedDownloadCancelled || (globalAbortController && globalAbortController.signal.aborted)) break;
-        const fileRef = stateArray.active.find(f => f.id === id);
-        if (!fileRef) continue;
-        let downloadName = fileRef.name;
-        const ext = (fileRef.format || '').toLowerCase();
-        if (ext && !downloadName.toLowerCase().endsWith('.' + ext)) downloadName += '.' + ext;
-        try {
-            const res = await callGasAPI('get_chunks', { fileId: fileRef.id, ownerId: currentOwnerId });
-            if (!res.success) throw new Error('Gagal memuat metadata.');
-            let chunks = res.data; if (typeof chunks === 'string') { try { chunks = JSON.parse(chunks); } catch (e) {} }
-            chunks.sort((a, b) => a.part - b.part);
-            const parts = await reconstructFileParts(chunks, (overall) => {
-                updateLoadingOverlay(overall, `Mengunduh (${done + 1}/${ids.length}) ${downloadName}... ${overall}%`);
-            }, globalAbortController.signal);
-            const blob = new Blob(parts, { type: mimeFromExt(ext) });
-            const blobUrl = URL.createObjectURL(blob);
-            const a = document.createElement('a'); a.href = blobUrl; a.download = downloadName;
-            document.body.appendChild(a); a.click(); document.body.removeChild(a);
-            setTimeout(() => URL.revokeObjectURL(blobUrl), 15000);
-            done++;
-        } catch (e) { failed++; if (e.message === "Dibatalkan oleh pengguna") break; }
+
+    // Kumpulkan dulu SEMUA file yang perlu diunduh + path relatifnya di dalam
+    // ZIP. File tunggal yang dipilih langsung diletakkan di root ZIP (pakai
+    // namanya sendiri), sedangkan isi tiap folder yang dipilih diletakkan
+    // mengikuti struktur path ASLI-nya, di dalam sub-folder bernama folder
+    // itu sendiri (persis strukturnya di Drive, bukan diratakan/di-flatten).
+    const zipEntries = [];
+    for (const id of fileIds) {
+        const f = stateArray.active.find(x => x.id === id);
+        if (!f) continue;
+        const ext = f.format ? '.' + f.format : '';
+        zipEntries.push({ id: f.id, relPath: f.name + ext });
     }
-    hideLoadingOverlay();
-    if (sharedDownloadCancelled) showToast("Unduhan massal dibatalkan.", true);
-    else if (failed > 0) showToast(`${done} berkas terunduh, ${failed} gagal.`, true);
-    else showToast(`${done} berkas berhasil diunduh.`, false);
+    for (const path of folderPaths) {
+        const folderName = path.split('/').pop();
+        stateArray.active.forEach(f => {
+            if (f.folder === path || (f.folder && f.folder.startsWith(path + '/'))) {
+                const sub = f.folder === path ? '' : f.folder.substring(path.length + 1) + '/';
+                const ext = f.format ? '.' + f.format : '';
+                zipEntries.push({ id: f.id, relPath: folderName + '/' + sub + f.name + ext });
+            }
+        });
+    }
+
+    if (zipEntries.length === 0) { showToast("Tidak ada berkas untuk diunduh (folder yang dipilih kosong).", true); return; }
+
+    showLoadingOverlay(`Menyiapkan ZIP (0/${zipEntries.length})...`, true, true);
+    const zip = new JSZip();
+    let n = 0, failed = 0;
+    try {
+        for (const entry of zipEntries) {
+            if (sharedDownloadCancelled || globalAbortController.signal.aborted) throw new Error("Dibatalkan oleh pengguna");
+            n++;
+            updateLoadingOverlay(Math.round(n / zipEntries.length * 90), `Mengunduh (${n}/${zipEntries.length})...`);
+            const chunkRes = await callGasAPI('get_chunks', { fileId: entry.id, ownerId: currentOwnerId });
+            if (!chunkRes.success) { failed++; continue; }
+            let chunks = chunkRes.data; if (typeof chunks === 'string') { try { chunks = JSON.parse(chunks); } catch (e) {} }
+            chunks.sort((a, b) => a.part - b.part);
+            const parts = await reconstructFileParts(chunks, null, globalAbortController.signal);
+            zip.file(entry.relPath, new Blob(parts));
+        }
+        updateLoadingOverlay(95, "Membungkus ZIP...");
+        const zipBlob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+        const url = URL.createObjectURL(zipBlob);
+        hideLoadingOverlay();
+        const a = document.createElement('a'); a.href = url; a.download = buildTimestampedZipName();
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 20000);
+        if (failed > 0) showToast(`ZIP dibuat, tapi ${failed} berkas gagal diunduh.`, true);
+        else showToast("ZIP berhasil diunduh.", false);
+    } catch (e) {
+        hideLoadingOverlay();
+        if (e.message !== "Dibatalkan oleh pengguna") showToast("Gagal membuat ZIP: " + (e.message || 'kesalahan'), true);
+        else showToast("Unduhan dibatalkan.", true);
+    }
 }
 
 function confirmDeleteIndividualFile() {
@@ -2626,6 +2687,15 @@ function closeUploadModal() {
     sharedUploadActive = false;
 }
 
+// FIX: tombol "+" di halaman share sekarang jadi menu kecil (bukan langsung
+// buka upload) supaya viewer/editor dengan akses Edit juga bisa membuat
+// folder baru di sini, bukan cuma upload file.
+function openSharedFabMenu() {
+    if (sharedUploadFabRole !== 'edit') { showToast("Anda tidak memiliki akses Edit di folder ini.", true); return; }
+    document.getElementById('shared-fab-menu-modal').style.display = 'flex';
+}
+function closeSharedFabMenu() { document.getElementById('shared-fab-menu-modal').style.display = 'none'; }
+
 // Dipanggil dari tombol "+" di halaman share (viewer dengan akses Edit).
 // Modal upload yang sama dipakai ulang, tapi startMultiUpload() akan mengarahkan
 // penyimpanan metadata ke action 'shared_save_metadata' & folder tujuan = folder
@@ -2634,6 +2704,32 @@ function openSharedUploadModal() {
     if (sharedUploadFabRole !== 'edit') { showToast("Anda tidak memiliki akses Edit di folder ini.", true); return; }
     sharedUploadActive = true;
     openUploadModal();
+}
+
+// FIX: viewer/editor dengan akses Edit sekarang juga bisa membuat SUBFOLDER
+// baru di dalam folder yang sedang dibuka lewat tautan berbagi (dulu cuma
+// bisa upload file). Cakupan & peran tetap divalidasi final di server lewat
+// action 'shared_create_folder' (lihat backend.gs) -- folder baru tercatat
+// milik pemilik share, sama seperti file yang diupload lewat share.
+async function sharedCreateFolderPrompt() {
+    if (sharedUploadFabRole !== 'edit') { showToast("Anda tidak memiliki akses Edit di folder ini.", true); return; }
+    const name = prompt("Nama folder baru:");
+    if (name === null) return;
+    const trimmed = name.trim();
+    if (!trimmed) return showToast("Nama folder tidak boleh kosong.", true);
+    if (trimmed.length > 300) return showToast("Nama terlalu panjang (maksimal 300 karakter).", true);
+    if (/[<>\/]/.test(trimmed)) return showToast("Nama tidak boleh mengandung karakter < > /.", true);
+    const newPath = sharedCurrentPath ? (sharedCurrentPath + '/' + trimmed) : trimmed;
+    showLoadingOverlay("Membuat folder...", false, false);
+    const res = await callGasAPI('shared_create_folder', { folderPath: newPath, shareId: pendingShareCode, viewerUid: sharedViewerUid });
+    hideLoadingOverlay();
+    if (res && res.success) {
+        if (!sharedContentsCache.subfolders.includes(newPath)) sharedContentsCache.subfolders.push(newPath);
+        showToast("Folder berhasil dibuat.", false);
+        if (!sharedIsSelecting) renderSharedFolderBody({ item: { name: sharedCurrentFolderName, contents: sharedContentsCache }, ownerId: pendingShareResolved && pendingShareResolved.ownerId, ownerName: pendingShareResolved && pendingShareResolved.ownerName, role: sharedUploadFabRole }, pendingShareCode, sharedViewerUid, sharedCurrentPath);
+    } else {
+        showToast((res && res.message) || "Gagal membuat folder.", true);
+    }
 }
 
 function handleMultiFileSelect(input) {
@@ -3650,28 +3746,41 @@ async function refreshSharedWithMe() {
         const items = buildSharedWithMeFromRaw(raw, currentOwnerId);
         lastSharedSignature = JSON.stringify(items);
         sharedWithMeItems = items;
-        renderSharedWithMeSidebar();
+        if (currentTab === 'shared') renderSharedWithMeMain(document.getElementById('search-input') ? document.getElementById('search-input').value : '');
     } catch (e) {
         const res = await callGasAPI('get_shared_with_me', { uid: currentOwnerId });
         if (res && res.success) {
             sharedWithMeItems = (res.items || []).filter(it => it.itemType === 'folder');
             lastSharedSignature = JSON.stringify(sharedWithMeItems);
-            renderSharedWithMeSidebar();
+            if (currentTab === 'shared') renderSharedWithMeMain(document.getElementById('search-input') ? document.getElementById('search-input').value : '');
         }
     }
 }
-function renderSharedWithMeSidebar() {
-    const container = document.getElementById('sidebar-shared-list');
-    if (!container) return;
-    if (sharedWithMeItems.length === 0) { container.innerHTML = `<div style="padding:8px 12px; font-size:12px; color:var(--text-muted);">Belum ada folder yang dibagikan ke Anda.</div>`; return; }
-    container.innerHTML = '';
-    sharedWithMeItems.forEach(item => {
-        const row = document.createElement('div'); row.className = 'shared-item-row';
-        row.innerHTML = `<span class="material-symbols-rounded" style="font-size:20px;">${item.itemType === 'folder' ? 'folder_shared' : 'description'}</span>
-            <div style="overflow:hidden;"><div style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:150px;">${item.itemName}</div><span class="shared-item-owner">oleh ${item.ownerName}</span></div>`;
-        row.onclick = () => { window.open(buildShareLink(item.shareId), '_blank'); };
-        container.appendChild(row);
-    });
+// PATCH: dulu daftar "Dibagikan Kepada Anda" ini ditaruh sebagai list kecil
+// permanen di sidebar (bikin sidebar penuh). Sekarang dipindah jadi tab
+// tersendiri ("Dibagikan"), dirender pakai grid folder yang sama seperti tab
+// Folder lainnya -- klik salah satu itemnya tetap membuka link share itu di
+// tab baru, sama seperti sebelumnya.
+function renderSharedWithMeMain(filterText = '') {
+    document.getElementById('folder-container-wrapper').style.display = 'block';
+    document.getElementById('folder-section-label').innerText = 'Dibagikan Kepada Anda';
+    document.getElementById('file-list').innerHTML = '';
+    document.getElementById('select-all-container').style.display = 'none';
+    const folderList = document.getElementById('folder-list');
+    let items = sharedWithMeItems;
+    if (filterText) items = items.filter(it => (it.itemName || '').toLowerCase().includes(filterText.toLowerCase()));
+    renderInBatches_(folderList, items, (item) => {
+        const card = document.createElement('div'); card.className = 'folder-card';
+        card.onclick = () => { window.open(buildShareLink(item.shareId), '_blank'); };
+        card.innerHTML = `
+            <div class="folder-icon-box"><span class="material-symbols-rounded">${item.itemType === 'folder' ? 'folder_shared' : 'description'}</span></div>
+            <div class="folder-info">
+                <span class="folder-name" title="${escapeHtml(item.itemName)}">${escapeHtml(item.itemName)}</span>
+                <span class="folder-meta">Dibagikan oleh ${escapeHtml(item.ownerName)}</span>
+            </div>
+        `;
+        return card;
+    }, `<div style="grid-column:1/-1; text-align:center; padding:60px 20px; color:var(--text-muted); font-size:14px;">Belum ada folder yang dibagikan ke Anda.</div>`);
 }
 
 function getViewerAccountForOwner(ownerId) { return accountsList.find(a => a.ownerId === ownerId) || null; }
@@ -3927,6 +4036,10 @@ async function redirectOwnerToTrash(ownerAccount, res) {
     document.getElementById('shared-view').style.display = 'none';
     document.getElementById('login-view').style.display = 'none';
     document.getElementById('app-layout').style.display = 'flex';
+    // FIX (konsisten dengan redirectOwnerToDrive): pastikan drawer sidebar
+    // mobile & backdrop-nya tidak ketinggalan dalam kondisi "terbuka" di sini juga.
+    document.getElementById('app-sidebar').classList.remove('open');
+    document.getElementById('sidebar-backdrop').classList.remove('open');
 
     window.history.replaceState({}, document.title, location.origin + location.pathname);
 
@@ -3970,6 +4083,10 @@ async function redirectOwnerToDeletedError(ownerAccount, res) {
     document.getElementById('shared-view').style.display = 'none';
     document.getElementById('login-view').style.display = 'none';
     document.getElementById('app-layout').style.display = 'flex';
+    // FIX (konsisten dengan redirectOwnerToDrive): pastikan drawer sidebar
+    // mobile & backdrop-nya tidak ketinggalan dalam kondisi "terbuka" di sini juga.
+    document.getElementById('app-sidebar').classList.remove('open');
+    document.getElementById('sidebar-backdrop').classList.remove('open');
 
     window.history.replaceState({}, document.title, location.origin + location.pathname);
 
@@ -4031,6 +4148,34 @@ function hideSharedUploadFab() {
 // sendiri (yang kadang gak pernah habis-habis kalau nasib snapshotnya apes).
 const SHARED_FORCE_LIVE_EVERY_TICKS = 4; // paksa baca live tiap ~4 detik, terlepas dari sukses/gagalnya gviz
 
+// FIX BUG "404 SAAT FOLDER PERANTARA DI-RENAME": mekanisme forceLive di atas
+// (lihat komentar di startSharedPolling) cuma menjamin ROOT folder yang
+// dibagikan selalu diresolusi segar -- tapi sharedPathSegments (nama-nama
+// folder di antara root dan folder yang lagi dibuka) tetap dipakai APA
+// ADANYA. Kalau yang di-rename BUKAN root share itu sendiri, tapi salah
+// satu folder PERANTARA di antaranya, nama lama itu bikin path hasil
+// gabungan jadi tidak valid lagi walau isinya sendiri masih ada. Fungsi ini
+// menelusuri dari root TURUN level demi level (bukan path absolut sekali
+// jalan) supaya level mana pun yang masih valid tetap dipakai, dan baru
+// berhenti persis di folder terakhir yang namanya benar-benar sudah
+// berubah/hilang -- isinya tetap ditampilkan dengan benar (walau mungkin di
+// level yang sedikit lebih tinggi dari posisi semula), bukan 404 mati.
+async function tryResolveWithAncestorFallback(code, viewerUid, segments) {
+    const rootRes = await getSharedDataFromSheets(code, viewerUid, null, true);
+    if (!rootRes || !rootRes.success || !rootRes.authorized || !rootRes.item) return null;
+    let lastGood = { res: rootRes, path: rootRes.item.path, segments: [] };
+    let builtPath = rootRes.item.path;
+    for (let i = 0; i < segments.length; i++) {
+        const candidatePath = builtPath + '/' + segments[i];
+        const candidateRes = await getSharedDataFromSheets(code, viewerUid, candidatePath, true);
+        if (candidateRes && candidateRes.success && candidateRes.authorized) {
+            lastGood = { res: candidateRes, path: candidatePath, segments: segments.slice(0, i + 1) };
+            builtPath = candidatePath;
+        } else break;
+    }
+    return lastGood;
+}
+
 function startSharedPolling(code) {
     stopSharedPolling();
     sharedDataSignature = null;
@@ -4086,7 +4231,25 @@ function startSharedPolling(code) {
         if (!forceLive && (!res || !res.success || res.deleted || !res.authorized)) {
             res = await getSharedDataFromSheets(code, sharedViewerUid, sharedCurrentPath, true);
         }
-        
+
+        // Sebelum divonis 404/tidak authorized, kalau kita SEDANG browsing
+        // lebih dalam dari root share (bukan pas root-nya sendiri), coba
+        // dulu telusuri dari root turun level demi level -- ini menangkap
+        // kasus folder PERANTARA (bukan root) yang di-rename, supaya isinya
+        // tetap ditampilkan (bukan 404), lihat catatan di
+        // tryResolveWithAncestorFallback().
+        if ((!res || !res.success || res.deleted || !res.authorized) && sharedPathSegments.length > 0) {
+            const fallback = await tryResolveWithAncestorFallback(code, sharedViewerUid, sharedPathSegments);
+            if (fallback) {
+                res = fallback.res;
+                queryPath = fallback.path;
+                if (fallback.segments.length !== sharedPathSegments.length) {
+                    sharedPathSegments = fallback.segments;
+                    showToast("Salah satu folder di jalur ini sudah diganti nama/dipindah pemiliknya — ditampilkan dari folder terdekat yang masih ada.", true);
+                }
+            }
+        }
+
         // JIKA FILE DIHAPUS / PINDAH KE SAMPAH (sudah dikonfirmasi live, final)
         if (!res || !res.success || res.deleted) { 
             stopSharedPolling(); 
@@ -4422,37 +4585,84 @@ async function downloadSharedFile(fileId, format, displayName, shareId, viewerUi
     } catch (e) { if (!silentOverlay) { hideLoadingOverlay(); showToast("Gagal mengunduh: " + e.message, true); } return false; }
 }
 
+// PATCH: dulu kalau yang dipilih banyak (file dan/atau folder), tiap folder
+// diunduh sebagai ZIP-nya SENDIRI-SENDIRI (banyak file ZIP terpisah muncul
+// sekaligus). Sekarang: 1 item saja (file atau folder) tetap seperti biasa
+// lewat jalur langsung yang sudah ada; begitu terpilih LEBIH DARI 1 item,
+// semuanya digabung jadi SATU ZIP saja, isi tiap folder mengikuti struktur
+// path aslinya (di dalam sub-folder bernama folder itu sendiri), sama
+// seperti versi drive sendiri.
 async function downloadSharedSelectedBulk() {
     const fileIds = Array.from(sharedSelectedIds);
     const folderPaths = Array.from(sharedSelectedFolderPaths);
     const total = fileIds.length + folderPaths.length;
     if (total === 0) return;
+
+    if (total === 1 && fileIds.length === 1) {
+        const item = (sharedContentsCache.files || []).find(f => f.id === fileIds[0]);
+        if (item) {
+            const displayName = item.name + (item.format ? '.' + item.format : '');
+            await downloadSharedFile(item.id, item.format, displayName, pendingShareCode, sharedViewerUid);
+        }
+        return;
+    }
+    if (total === 1 && folderPaths.length === 1) {
+        await buildAndDownloadSharedZip(folderPaths[0], folderPaths[0].split('/').pop());
+        return;
+    }
+
+    if (!window.JSZip) { showToast("Gagal memuat pustaka ZIP. Periksa koneksi internet Anda.", true); return; }
     sharedDownloadCancelled = false;
     globalAbortController = new AbortController();
-    showLoadingOverlay(`Menyiapkan unduhan (0/${total})...`, true, true);
-    let done = 0, failed = 0;
+    showLoadingOverlay(`Menyiapkan daftar isi (0/${total})...`, true, true);
 
-    for (const id of fileIds) {
-        if (sharedDownloadCancelled || globalAbortController.signal.aborted) break;
-        const item = (sharedContentsCache.files || []).find(f => f.id === id);
-        if (!item) { done++; continue; }
-        let displayName = item.name + (item.format ? '.' + item.format : '');
-        updateLoadingOverlay(Math.round(done / total * 100), `Mengunduh (${done + 1}/${total}) ${displayName}...`);
-        const ok = await downloadSharedFile(item.id, item.format, displayName, pendingShareCode, sharedViewerUid, true);
-        if (ok) done++; else failed++;
-    }
-    for (const path of folderPaths) {
-        if (sharedDownloadCancelled || globalAbortController.signal.aborted) break;
-        const folderName = path.split('/').pop();
-        updateLoadingOverlay(Math.round(done / total * 100), `Mengompres folder (${done + 1}/${total}) "${folderName}"...`);
-        const ok = await buildAndDownloadSharedZip(path, folderName, true);
-        if (ok) done++; else failed++;
-    }
+    try {
+        // Kumpulkan seluruh entri yang perlu masuk ZIP: file tunggal langsung
+        // di root ZIP, isi tiap folder terpilih mengikuti path asli di dalam
+        // sub-folder bernama folder itu sendiri.
+        const zipEntries = [];
+        for (const id of fileIds) {
+            const item = (sharedContentsCache.files || []).find(f => f.id === id);
+            if (!item) continue;
+            zipEntries.push({ id: item.id, relPath: item.name + (item.format ? '.' + item.format : '') });
+        }
+        for (const path of folderPaths) {
+            if (sharedDownloadCancelled || globalAbortController.signal.aborted) throw new Error("Dibatalkan oleh pengguna");
+            const folderName = path.split('/').pop();
+            const nested = await collectSharedFolderFilesRecursive(path, folderName);
+            zipEntries.push(...nested);
+        }
 
-    hideLoadingOverlay();
-    if (sharedDownloadCancelled) showToast("Unduhan massal dibatalkan.", true);
-    else if (failed > 0) showToast(`${done} item terunduh, ${failed} gagal.`, true);
-    else showToast(`${done} item berhasil diunduh.`, false);
+        if (zipEntries.length === 0) { hideLoadingOverlay(); showToast("Tidak ada berkas untuk diunduh (folder yang dipilih kosong).", true); return; }
+
+        const zip = new JSZip();
+        const ownerIdForChunks = pendingShareResolved && pendingShareResolved.ownerId;
+        let n = 0, failed = 0;
+        for (const entry of zipEntries) {
+            if (sharedDownloadCancelled || globalAbortController.signal.aborted) throw new Error("Dibatalkan oleh pengguna");
+            n++;
+            updateLoadingOverlay(Math.round(n / zipEntries.length * 90), `Mengunduh (${n}/${zipEntries.length})...`);
+            const chunkRes = await getSharedFileChunks(entry.id, ownerIdForChunks, pendingShareCode, sharedViewerUid);
+            if (!chunkRes || !chunkRes.success) { failed++; continue; }
+            let chunks = chunkRes.data; if (typeof chunks === 'string') { try { chunks = JSON.parse(chunks); } catch (e) {} }
+            chunks.sort((a, b) => a.part - b.part);
+            const parts = await reconstructFileParts(chunks, null, null);
+            zip.file(entry.relPath, new Blob(parts));
+        }
+        updateLoadingOverlay(95, "Membungkus ZIP...");
+        const zipBlob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+        const url = URL.createObjectURL(zipBlob);
+        hideLoadingOverlay();
+        const a = document.createElement('a'); a.href = url; a.download = buildTimestampedZipName();
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 20000);
+        if (failed > 0) showToast(`ZIP dibuat, tapi ${failed} berkas gagal diunduh.`, true);
+        else showToast("ZIP berhasil diunduh.", false);
+    } catch (e) {
+        hideLoadingOverlay();
+        if (e.message !== "Dibatalkan oleh pengguna") showToast("Gagal membuat ZIP: " + (e.message || 'kesalahan'), true);
+        else showToast("Unduhan dibatalkan.", true);
+    }
 }
 
 async function buildAndDownloadSharedZip(folderPath, folderName, silentOverlay) {
@@ -4541,6 +4751,10 @@ async function renderSharedFolderBody(res, shareId, viewerUid, subPath) {
     sharedCurrentPath = subPath || '';
     sharedCurrentFolderName = res.item.name;
     sharedContentsCache = res.item.contents || { subfolders: [], files: [] };
+    // Peta shareInfo per-item (subfolder/file yang punya link berbagi
+    // sendiri) -- dipakai untuk fitur "Salin Link" per item di menu.
+    sharedContentsCache.subfolderShares = res.item.subfolderShares || {};
+    sharedContentsCache.fileShares = res.item.fileShares || {};
     sharedSelectedIds.clear(); sharedSelectedFolderPaths.clear(); sharedIsSelecting = false;
     updateSharedUploadFab(res.role, shareId, viewerUid);
     renderSharedBreadcrumb(Object.assign({ ownerId: pendingShareResolved ? pendingShareResolved.ownerId : res.ownerId, ownerName: pendingShareResolved ? pendingShareResolved.ownerName : res.ownerName }, res), subPath);
@@ -4692,9 +4906,16 @@ function openSharedFileMenu(e, fileId) {
         <div class="action-menu-item" onclick="sharedRenameFileFromMenu()"><span class="material-symbols-rounded">edit</span> Ganti Nama</div>
         <div class="action-menu-item danger" onclick="sharedDeleteFileFromMenu()"><span class="material-symbols-rounded">delete</span> Buang ke Sampah</div>`;
     }
+    // FITUR "SALIN LINK PER-ITEM": lihat catatan yang sama di openSharedFolderMenu().
+    const shareInfo = (sharedContentsCache.fileShares || {})[fileId];
+    let copyLinkHTML = '';
+    if (shareInfo && shareInfo.privacy && shareInfo.privacy !== 'private') {
+        copyLinkHTML = `<div class="action-menu-item" onclick="copySharedSubItemLink('${shareInfo.shareId}')"><span class="material-symbols-rounded">link</span> Salin Link</div>`;
+    }
     document.getElementById('file-opt-container').innerHTML = `
         <div class="action-menu-item" onclick="openSharedFileInfoFromMenu()"><span class="material-symbols-rounded">info</span> Detail Berkas</div>
         <div class="action-menu-item" onclick="downloadSharedFileFromMenu()"><span class="material-symbols-rounded">download</span> Download Berkas</div>
+        ${copyLinkHTML}
         ${editItemsHTML}
     `;
     document.getElementById('file-options-modal').style.display = 'flex';
@@ -4803,11 +5024,32 @@ function openSharedFolderMenu(e, folderPath) {
         <hr style="border: 0; border-top: 1px solid var(--border-color); margin: 6px 0;">
         <div class="action-menu-item danger" onclick="sharedDeleteFolderFromMenu()"><span class="material-symbols-rounded">delete</span> Buang ke Sampah</div>`;
     }
+    // FITUR "SALIN LINK PER-ITEM": cuma muncul kalau folder ini SUDAH punya
+    // link berbagi sendiri (bukan cuma warisan dari folder induk yang sedang
+    // dibuka) dan privasinya bukan 'private' -- kalau privasinya private,
+    // linknya cuma bisa dibuka pemiliknya sendiri, jadi tidak ada gunanya
+    // untuk disalin.
+    const shareInfo = (sharedContentsCache.subfolderShares || {})[folderPath];
+    let copyLinkHTML = '';
+    if (shareInfo && shareInfo.privacy && shareInfo.privacy !== 'private') {
+        copyLinkHTML = `<div class="action-menu-item" onclick="copySharedSubItemLink('${shareInfo.shareId}')"><span class="material-symbols-rounded">link</span> Salin Link</div>`;
+    }
     document.getElementById('file-opt-container').innerHTML = `
         <div class="action-menu-item" onclick="downloadSharedFolderFromMenu()"><span class="material-symbols-rounded">folder_zip</span> Download sebagai ZIP</div>
+        ${copyLinkHTML}
         ${editItemsHTML}
     `;
     document.getElementById('file-options-modal').style.display = 'flex';
+}
+// Salin link berbagi milik SENDIRI dari sebuah item (file/folder) di dalam
+// folder yang sedang dibagikan -- dipakai baik dalam mode Lihat maupun Edit.
+function copySharedSubItemLink(shareId) {
+    closeFileOptions();
+    const link = buildShareLink(shareId);
+    navigator.clipboard && navigator.clipboard.writeText(link).then(() => showToast("Link disalin!", false)).catch(() => {
+        const tmp = document.createElement('textarea'); tmp.value = link; document.body.appendChild(tmp); tmp.select();
+        document.execCommand('copy'); document.body.removeChild(tmp); showToast("Link disalin!", false);
+    });
 }
 // FIX: hapus (pindahkan ke sampah pemilik) subfolder beserta isinya, di
 // dalam folder share dengan akses Edit.
@@ -5999,6 +6241,19 @@ async function getSharedDataFromSheets(shareCode, viewerUid, subPath = null, for
                 // GAS juga bilang kosong/gagal -- berarti memang beneran kosong, pakai hasil gviz apa adanya.
             }
 
+            // FITUR "SALIN LINK PER-ITEM" (lihat catatan yang sama di
+            // backend.gs resolve_share): sertakan share milik sendiri tiap
+            // subfolder/file di sini juga, supaya jalur gviz (yang lebih
+            // sering dipakai daripada GAS) konsisten dengan jalur GAS.
+            const subfolderShares = {}, fileShares = {};
+            (raw.sharesRows || []).forEach(r => {
+                if (String(r[3] || '').trim() !== ownerId) return;
+                const sInfo = { shareId: r[0], privacy: String(r[5] || 'private').trim() };
+                const sType = String(r[2] || '').trim().toLowerCase();
+                if (sType === 'folder') subfolderShares[String(r[1] || '').trim()] = sInfo;
+                else if (sType === 'file') fileShares[String(r[1] || '').trim()] = sInfo;
+            });
+
             return {
                 success: true,
                 authorized: true,
@@ -6010,7 +6265,9 @@ async function getSharedDataFromSheets(shareCode, viewerUid, subPath = null, for
                 item: {
                     path: currentBrowsePath,
                     name: currentBrowsePath.split('/').pop() || 'Beranda',
-                    contents: contents
+                    contents: contents,
+                    subfolderShares: subfolderShares,
+                    fileShares: fileShares
                 }
             };
         }
