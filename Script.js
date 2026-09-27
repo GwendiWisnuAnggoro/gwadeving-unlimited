@@ -238,6 +238,11 @@ let selectedFolderPaths = new Set();
 let moveTargetMode = '';
 let clipboardItem = null; // { type: 'file'|'folder', id/path, label }
 let uploadQueue = [];
+let uploadQueueSeq = 0; // ID unik tiap item antrian (qid) -- dipakai untuk update kartu progress per-file
+let activeUploadXhrs = new Set(); // FIX: dulu cuma 1 xhr aktif (currentActiveXhr) karena upload sekuensial;
+                                  // sekarang beberapa file bisa upload BERSAMAAN jadi butuh Set biar
+                                  // tombol batal (closeUploadModal) bisa abort SEMUA xhr yang lagi jalan.
+const MAX_CONCURRENT_UPLOADS = 3; // berapa file yang boleh diupload bersamaan; sisanya otomatis antri
 let editingTargetAccount = null;
 let isUploadCancelled = false;
 let lastUploadFailureMessage = null;
@@ -2569,7 +2574,17 @@ function handleThumbLoadError(imgEl, containerId, iconName) {
 // UPLOAD MULTI-FILE SYSTEM
 // ==========================================
 function openUploadModal() { isUploadCancelled = false; uploadQueue = []; renderUploadQueue(); document.getElementById('upload-modal').style.display = 'flex'; }
-function closeUploadModal() { isUploadCancelled = true; if (currentActiveXhr) { currentActiveXhr.abort(); currentActiveXhr = null; } document.getElementById('upload-modal').style.display = 'none'; uploadQueue = []; sharedUploadActive = false; }
+function closeUploadModal() {
+    isUploadCancelled = true;
+    // Batalkan SEMUA upload yang sedang berjalan bersamaan (bukan cuma 1 xhr seperti dulu).
+    activeUploadXhrs.forEach(x => { try { x.abort(); } catch (e) {} });
+    activeUploadXhrs.clear();
+    if (currentActiveXhr) { currentActiveXhr.abort(); currentActiveXhr = null; }
+    document.getElementById('upload-modal').style.display = 'none';
+    uploadQueue.forEach(it => { if (it.previewUrl) URL.revokeObjectURL(it.previewUrl); });
+    uploadQueue = [];
+    sharedUploadActive = false;
+}
 
 // Dipanggil dari tombol "+" di halaman share (viewer dengan akses Edit).
 // Modal upload yang sama dipakai ulang, tapi startMultiUpload() akan mengarahkan
@@ -2589,30 +2604,127 @@ function handleMultiFileSelect(input) {
         const lastDot = rawName.lastIndexOf('.');
         const ext = lastDot !== -1 ? rawName.substring(lastDot + 1) : '';
         const pureName = lastDot !== -1 ? rawName.substring(0, lastDot) : rawName;
-        uploadQueue.push({ file: file, customName: pureName, ext: ext });
+        const item = {
+            qid: ++uploadQueueSeq, file: file, customName: pureName, ext: ext,
+            status: 'queued',       // queued -> uploading -> done | error
+            progressPercent: 0, loadedBytes: 0, statusText: '',
+            previewUrl: null, thumbBlob: null
+        };
+        uploadQueue.push(item);
+        prepareQueueItemPreview(item);
     }
     renderUploadQueue();
     setTimeout(() => { input.value = ""; }, 500);
 }
+
+// PRATINJAU VISUAL KARTU ANTRIAN (gaya Google Drive): dibuat LANGSUNG dari
+// file lokal begitu dipilih, sebelum upload apa pun dimulai. Untuk video,
+// hasil capture frame ini disimpan di item.thumbBlob dan dipakai ULANG nanti
+// sebagai thumbnail server saat upload beneran jalan -- tidak digenerate 2x.
+function prepareQueueItemPreview(item) {
+    const format = (item.ext || '').toLowerCase();
+    if (IMAGE_EXTENSIONS.has(format)) {
+        // Preview instan dari file asli. Untuk RAW/HEIC yang browser tidak
+        // bisa decode native, <img> di kartunya akan gagal load -- fallback
+        // ke ikon ditangani lewat onerror di markup renderUploadQueue().
+        item.previewUrl = URL.createObjectURL(item.file);
+        renderUploadQueue();
+    } else if (VIDEO_EXTENSIONS.has(format) || item.file.type.startsWith('video/')) {
+        generateVideoThumbnail(item.file).then(blob => {
+            if (!blob || !uploadQueue.includes(item)) return; // batal kalau item sudah dihapus dari antrian
+            item.thumbBlob = blob;
+            item.previewUrl = URL.createObjectURL(blob);
+            renderUploadQueue();
+        });
+    }
+}
+
 function updateQueueName(index, newName) { if (uploadQueue[index]) uploadQueue[index].customName = newName; }
-function removeFromQueue(index) { uploadQueue.splice(index, 1); renderUploadQueue(); }
+function removeFromQueue(index) {
+    const item = uploadQueue[index];
+    if (item && item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+    uploadQueue.splice(index, 1);
+    renderUploadQueue();
+}
+
+// Update murah (tanpa re-render seluruh list) yang dipanggil berkali-kali per
+// detik selama chunk sedang jalan -- kalau pakai renderUploadQueue() penuh di
+// sini, <img> thumbnail akan reflow/flicker terus dan berat di HP low-end.
+function updateQueueItemProgress(qid, percent, statusText) {
+    const bar = document.getElementById(`uq-bar-${qid}`);
+    const txt = document.getElementById(`uq-text-${qid}`);
+    if (bar) bar.style.width = percent + '%';
+    if (txt && statusText !== undefined) txt.innerText = statusText;
+}
+
+// Ringkasan keseluruhan (dulu cuma nunjukkin 1 file yang lagi jalan; sekarang
+// dihitung dari SEMUA file di antrian -- gabungan byte yang sudah terkirim
+// dibagi total byte semua file, supaya tetap akurat walau beberapa file
+// jalan bersamaan).
+function updateAggregateUploadUI() {
+    const progressBar = document.getElementById('upload-progress-bar');
+    const percentEl = document.getElementById('upload-percentage');
+    const fileNameText = document.getElementById('upload-filename');
+    if (!progressBar && !percentEl && !fileNameText) return;
+    let totalBytes = 0, loadedBytes = 0, doneCount = 0, errorCount = 0, uploadingCount = 0;
+    uploadQueue.forEach(it => {
+        const size = it.file ? it.file.size : 0;
+        totalBytes += size;
+        if (it.status === 'done') { loadedBytes += size; doneCount++; }
+        else if (it.status === 'error') { errorCount++; }
+        else if (it.status === 'uploading') { uploadingCount++; loadedBytes += (it.loadedBytes || 0); }
+    });
+    const percent = totalBytes > 0 ? Math.min(100, (loadedBytes / totalBytes) * 100).toFixed(1) : 0;
+    if (progressBar) progressBar.style.width = percent + '%';
+    if (percentEl) percentEl.innerText = percent + '%';
+    if (fileNameText) fileNameText.innerText = `${doneCount}/${uploadQueue.length} selesai${errorCount ? ', ' + errorCount + ' gagal' : ''}`;
+}
+
 function renderUploadQueue() {
     const container = document.getElementById('upload-queue-list');
     if (uploadQueue.length === 0) { container.innerHTML = ``; return; }
     let htmlContent = '';
     uploadQueue.forEach((qItem, index) => {
-        const disableAttr = isUploadInProgress ? 'disabled' : '';
-        const opacity = isUploadInProgress ? '0.6' : '1';
-        // FIX #5: value attribute wajib di-escape (kalau nama file mengandung tanda kutip
-        // dua bisa "kabur" dari atribut lalu menyisipkan HTML/JS lain).
+        const iconName = getFileIcon(qItem.ext);
+        const thumbInner = qItem.previewUrl
+            ? `<img src="${qItem.previewUrl}" alt="" onerror="this.replaceWith(Object.assign(document.createElement('span'),{className:'material-symbols-rounded',textContent:'${iconName}'}));">`
+            : `<span class="material-symbols-rounded">${iconName}</span>`;
+
+        let statusHTML;
+        if (qItem.status === 'done') {
+            statusHTML = `<div class="uq-status uq-status-done"><span class="material-symbols-rounded" style="font-size:15px;">check_circle</span> Selesai</div>`;
+        } else if (qItem.status === 'error') {
+            statusHTML = `<div class="uq-status uq-status-error"><span class="material-symbols-rounded" style="font-size:15px;">error</span> ${escapeHtml(qItem.statusText || 'Gagal')}</div>`;
+        } else if (qItem.status === 'uploading') {
+            statusHTML = `
+                <div class="progress-track" style="height:5px; margin-top:6px;"><div class="progress-fill is-uploading" id="uq-bar-${qItem.qid}" style="width:${qItem.progressPercent || 0}%;"></div></div>
+                <div class="uq-status" id="uq-text-${qItem.qid}" style="margin-top:3px;">${escapeHtml(qItem.statusText || 'Mengunggah...')}</div>`;
+        } else {
+            statusHTML = `<div class="uq-status uq-status-queued"><span class="material-symbols-rounded" style="font-size:15px;">schedule</span> Menunggu giliran</div>`;
+        }
+
+        const canEditName = qItem.status === 'queued';
+        const nameField = canEditName
+            ? `<div class="inline-input-group" style="margin-bottom:0;">
+                   <input type="text" value="${escapeHtml(qItem.customName)}" oninput="updateQueueName(${index}, this.value)" placeholder="Nama berkas...">
+                   <span class="ext-label">${escapeHtml(qItem.ext ? '.' + qItem.ext : '')}</span>
+               </div>`
+            : `<div class="uq-name">${escapeHtml(qItem.customName + (qItem.ext ? '.' + qItem.ext : ''))}</div>`;
+
+        let actionHTML;
+        if (qItem.status === 'uploading') actionHTML = ''; // lagi jalan -- batal per-file lewat tombol batal semua (close modal)
+        else if (qItem.status === 'done') actionHTML = `<span class="material-symbols-rounded" style="color:var(--primary);font-size:20px;">check_circle</span>`;
+        else actionHTML = `<button class="icon-btn" style="color:var(--danger); padding:8px; background:var(--danger-light); border-radius:var(--radius-sm); flex-shrink:0;" onclick="removeFromQueue(${index})" title="Hapus"><span class="material-symbols-rounded" style="font-size:18px;">delete</span></button>`;
+
         htmlContent += `
-            <div style="display:flex; align-items:center; gap:8px; margin-bottom: 8px; opacity:${opacity};">
-                <div class="inline-input-group" style="margin-bottom:0; flex:1;">
-                    <input type="text" value="${escapeHtml(qItem.customName)}" oninput="updateQueueName(${index}, this.value)" placeholder="Nama berkas..." ${disableAttr}>
-                    <span class="ext-label" style="min-width: 50px; text-align: center;">${escapeHtml(qItem.ext ? '.' + qItem.ext : '')}</span>
+            <div class="upload-queue-card">
+                <div class="upload-queue-thumb">${thumbInner}</div>
+                <div class="upload-queue-info">
+                    ${nameField}
+                    <div style="font-size:11px;color:var(--text-muted);margin-top:2px;">${formatBytes(qItem.file ? qItem.file.size : 0)}</div>
+                    ${statusHTML}
                 </div>
-                <span style="font-size:11.5px; color:var(--text-muted); flex-shrink:0; min-width:56px; text-align:right;">${formatBytes(qItem.file ? qItem.file.size : 0)}</span>
-                <button class="icon-btn" style="color:var(--danger); padding:8px; background:var(--danger-light); border-radius:var(--radius-sm); flex-shrink: 0;" onclick="removeFromQueue(${index})" title="Hapus" ${disableAttr}><span class="material-symbols-rounded" style="font-size:18px;">delete</span></button>
+                ${actionHTML}
             </div>`;
     });
     container.innerHTML = htmlContent;
@@ -2626,7 +2738,7 @@ let lastKnownUploadSpeedBps = 0;
 function uploadChunkXHR(formData, startBytes, totalFileSize, onProgress, forceWorker) {
     return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
-        currentActiveXhr = xhr;
+        activeUploadXhrs.add(xhr);
         
         // PATCH: sebelumnya SELALU acak (getRandomWorker()), jadi kalau chunk ini
         // sedang di-retry gara-gara worker pertama gagal, ada kemungkinan (1/N)
@@ -2678,7 +2790,7 @@ function uploadChunkXHR(formData, startBytes, totalFileSize, onProgress, forceWo
         
         xhr.onload = () => { 
             clearInterval(fallbackTimer);
-            currentActiveXhr = null; 
+            activeUploadXhrs.delete(xhr); 
             // FIX: sebelumnya kalau gagal cuma dilempar "HTTP 400" doang -- gak
             // kelihatan ALASAN aslinya (Telegram/Cloudflare biasanya balikin body
             // JSON berisi description yang jelas, mis. "Bad Request: file must be
@@ -2701,8 +2813,8 @@ function uploadChunkXHR(formData, startBytes, totalFileSize, onProgress, forceWo
             } catch (e) { reject(e); } 
         };
         
-        xhr.onerror = () => { clearInterval(fallbackTimer); currentActiveXhr = null; reject(new Error('Koneksi terputus saat mengunggah')); };
-        xhr.onabort = () => { clearInterval(fallbackTimer); currentActiveXhr = null; reject(new Error('Upload dibatalkan.')); };
+        xhr.onerror = () => { clearInterval(fallbackTimer); activeUploadXhrs.delete(xhr); reject(new Error('Koneksi terputus saat mengunggah')); };
+        xhr.onabort = () => { clearInterval(fallbackTimer); activeUploadXhrs.delete(xhr); reject(new Error('Upload dibatalkan.')); };
         
         xhr.send(formData);
     });
@@ -2786,322 +2898,84 @@ function generateVideoThumbnail(file) {
 
 
 
+// ==========================================
+// FIX BESAR: UPLOAD PARALEL + KARTU VISUAL PER FILE (gaya Google Drive)
+// Dulu: 1 file diupload dulu sampai selesai, baru lanjut ke file berikutnya
+// (while-loop sekuensial), dan UI-nya cuma 1 progress bar teks global yang
+// dipakai bergantian untuk file yang sedang jalan.
+// Sekarang: sampai MAX_CONCURRENT_UPLOADS file diupload BERSAMAAN (worker
+// pool), sisanya otomatis "menunggu giliran" dan langsung lanjut begitu ada
+// slot kosong. Tiap file punya kartu sendiri (thumbnail/ikon + progress bar +
+// status sendiri) di renderUploadQueue(), bukan cuma teks nama+persentase.
+// ==========================================
 async function startMultiUpload() {
     if (uploadQueue.length === 0) return showToast("Pilih file terlebih dahulu!", true);
-    if (isUploadInProgress) return; 
+    if (isUploadInProgress) return;
+
+    // PATCH: DETEKSI FILE 0 BYTE SEBELUM DIKIRIM -- dulu dicek di tengah
+    // while-loop sekuensial; sekarang semua file jalan berbarengan jadi
+    // validasi ini harus selesai duluan, sebelum satu pun worker dimulai.
+    for (let i = uploadQueue.length - 1; i >= 0; i--) {
+        const f = uploadQueue[i].file;
+        if (!f || f.size === 0) {
+            showToast(`${uploadQueue[i].customName}: file 0 byte / belum sepenuhnya terunduh (biasanya file iCloud/Files yang belum dibuka). Buka dulu filenya di app Files/Photos sampai terlihat penuh, lalu upload ulang.`, true);
+            if (uploadQueue[i].previewUrl) URL.revokeObjectURL(uploadQueue[i].previewUrl);
+            uploadQueue.splice(i, 1);
+        }
+    }
+    if (uploadQueue.length === 0) return;
+
     isUploadInProgress = true;
     isUploadCancelled = false;
     lastUploadFailureMessage = null;
-    
-    const btn = document.getElementById('btn-upload'); 
+
+    const btn = document.getElementById('btn-upload');
     btn.disabled = true;
-    const box = document.getElementById('upload-progress-box'); 
-    const sText = document.getElementById('upload-status-text');
-    const fileNameText = document.getElementById('upload-filename'); // Elemen UI baru
+    const box = document.getElementById('upload-progress-box');
     box.style.display = 'block';
 
-    const progressBar = document.getElementById('upload-progress-bar');
-    const percentEl = document.getElementById('upload-percentage');
-    const byteStatusEl = document.getElementById('upload-byte-status');
-    if (progressBar) progressBar.style.width = '0%';
-    if (percentEl) percentEl.innerText = '0%';
-    if (byteStatusEl) byteStatusEl.innerText = `0 B / 0 B`;
-
+    uploadQueue.forEach(it => { it.status = 'queued'; it.progressPercent = 0; it.loadedBytes = 0; it.statusText = ''; });
     renderUploadQueue();
+    updateAggregateUploadUI();
 
-    let totalFiles = uploadQueue.length; 
+    const totalFiles = uploadQueue.length;
     let successCount = 0;
-    let currentIdx = 0;
+    let nextIndex = 0;
 
-    while (uploadQueue.length > 0) {
-        if (isUploadCancelled) break;
-        
-        const qItem = uploadQueue[0];
-        currentIdx++;
-        const fileInput = qItem.file;
-        const customName = qItem.customName.trim() || fileInput.name.split('.')[0];
-        const format = qItem.ext.toLowerCase();
-        const folderTarget = sharedUploadActive ? sharedCurrentPath : ((currentTab === 'home') ? currentPath : '');
-        const uniqueId = 'FILE_' + Date.now() + '_' + currentIdx;
-        const prefix = `[${currentIdx}/${totalFiles}] `;
-
-        // PATCH: DETEKSI FILE 0 BYTE SEBELUM DIKIRIM
-        // Kalau file dipilih dari iCloud Drive/Files dan belum full ke-download
-        // ke device (masih placeholder), Safari/iOS kadang tetap kasih File
-        // object ke web tapi isinya kosong (size 0) atau gagal dibaca. Kalau
-        // dibiarkan lolos, ini baru ketahuan gagal SETELAH round-trip ke
-        // server, dengan pesan generik dari Telegram ("there is no document
-        // in the request") yang membingungkan. Sekarang dicek duluan di sini
-        // supaya pesannya jelas dan file lain di antrian tetap lanjut diproses.
-        if (!fileInput.size || fileInput.size === 0) {
-            showToast(`${customName}: file 0 byte / belum sepenuhnya terunduh (biasanya file iCloud/Files yang belum dibuka). Buka dulu filenya di app Files/Photos sampai terlihat penuh, lalu upload ulang.`, true);
-            uploadQueue.shift();
+    async function worker() {
+        while (true) {
+            if (isUploadCancelled) return;
+            const myIndex = nextIndex++;
+            if (myIndex >= uploadQueue.length) return;
+            const item = uploadQueue[myIndex];
+            item.status = 'uploading';
             renderUploadQueue();
-            continue;
-        }
-
-        if (fileNameText) fileNameText.innerText = customName;
-        sText.innerHTML = `${prefix}Menyiapkan...`;
-
-        let thumbTelegramId = null;
-        
-        // =====================================
-        // PENANGANAN THUMBNAIL VIDEO
-        // =====================================
-        if (fileInput.type.startsWith('video/') || VIDEO_EXTENSIONS.has(format)) {
-            sText.innerHTML = `${prefix}Membuat thumbnail video...`;
-            let thumbBlob = await generateVideoThumbnail(fileInput);
-            
-            if (isUploadCancelled) break;
-            
-            if (thumbBlob) {
-                const fdThumb = new FormData(); 
-                fdThumb.append('chat_id', TELEGRAM_CHAT_ID); 
-                fdThumb.append('document', thumbBlob, 'cover.dat'); 
-                
-                const activeWorker = getRandomWorker();
-                const uploadUrl = `${activeWorker}/upload?token=${WORKER_PASSWORD}&bot_token=${TELEGRAM_BOT_TOKEN}`;
-                try { 
-                    const tRes = await fetch(uploadUrl, { method: 'POST', body: fdThumb }).then(r => r.json()); 
-                    if (tRes.ok) {
-                        if (tRes.result.document) thumbTelegramId = tRes.result.document.file_id;
-                        else if (tRes.result.sticker) thumbTelegramId = tRes.result.sticker.file_id;
-                    }
-                } catch (e) { console.error("Gagal upload thumb", e); }
-            }
-        } 
-        // =====================================
-        // PENANGANAN THUMBNAIL GAMBAR
-        // =====================================
-        else if (IMAGE_EXTENSIONS.has(format)) {
-            sText.innerHTML = `${prefix}Menyiapkan preview image...`;
-            let previewBlob = null;
-            let extractedJpegFallback = null;
-
-            // 1) Coba decode & kompres LANGSUNG dari file aslinya dulu.
-            //    convertImageToWebP() sekarang mencoba 2 cara decode native
-            //    browser (createImageBitmap, lalu <img> tag) sebelum dianggap
-            //    gagal. Untuk format biasa (jpg/png/webp/gif/bmp/avif/dll) ini
-            //    SELALU berhasil di sini. Untuk sebagian HEIC ini juga bisa
-            //    berhasil (browser dgn dukungan HEIC native) -- hasilnya foto
-            //    asli penuh, bukan cuma preview kecil ter-embed.
-            try {
-                previewBlob = await Promise.race([
-                    convertImageToWebP(fileInput, 5 * 1024 * 1024),
-                    new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 9000))
-                ]);
-            } catch (e) { previewBlob = null; }
-
-            // 2) Kalau langkah 1 gagal -- ini yang terjadi untuk SEMUA format
-            //    RAW kamera (memang tidak ada browser yang bisa mendekode RAW
-            //    lewat <canvas>/<img>) dan HEIC di browser tanpa dukungan
-            //    native -- ekstrak preview JPEG yang SUDAH ter-embed di dalam
-            //    file itu sendiri lewat extractRawEmbeddedPreview(). Fungsi
-            //    itu: (a) baca tag resmi ThumbnailOffset/JpegIFOffset,
-            //    (b) kalau tidak ketemu/tidak valid, pindai SELURUH byte file
-            //    cari penanda JPEG secara langsung, dan (c) SETIAP kandidat
-            //    yang ditemukan WAJIB lolos tes decode ulang sebelum
-            //    dikembalikan. Jadi begitu fungsi ini balikin sesuatu, itu
-            //    sudah pasti valid & bisa ditampilkan -- bukan tebakan lagi.
-            if (!previewBlob && ['cr2','nef','arw','dng','raw','rw2','orf','pef','srw','heic','heif'].includes(format)) {
-                try {
-                    const u8 = await extractRawEmbeddedPreview(fileInput);
-                    if (u8) {
-                        const extracted = new Blob([u8], { type: 'image/jpeg' });
-                        extractedJpegFallback = extracted; // sudah tervalidasi bisa didekode
-                        try {
-                            previewBlob = await Promise.race([
-                                convertImageToWebP(extracted, 5 * 1024 * 1024),
-                                new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 9000))
-                            ]);
-                        } catch (e) { previewBlob = null; }
-                    }
-                } catch (e) { /* memang tidak ada preview JPEG apa pun yang bisa ditemukan di file ini */ }
-            }
-
-            // Kalau kompresi webp di atas gagal/timeout tapi kita sudah punya
-            // hasil ekstraksi yang TERVALIDASI valid, pakai itu apa adanya
-            // (belum dikompres, tapi dijamin bisa ditampilkan) -- daripada
-            // tidak punya thumbnail sama sekali.
-            if (!previewBlob && extractedJpegFallback) previewBlob = extractedJpegFallback;
-
-            if (previewBlob) {
-                const fdThumb = new FormData(); 
-                fdThumb.append('chat_id', TELEGRAM_CHAT_ID); 
-                fdThumb.append('document', previewBlob, 'cover.dat'); 
-                
-                const activeWorker = getRandomWorker();
-                const uploadUrl = `${activeWorker}/upload?token=${WORKER_PASSWORD}&bot_token=${TELEGRAM_BOT_TOKEN}`;
-                try { 
-                    const tRes = await fetch(uploadUrl, { method: 'POST', body: fdThumb }).then(r => r.json()); 
-                    if (tRes.ok) {
-                        if (tRes.result.document) thumbTelegramId = tRes.result.document.file_id;
-                        else if (tRes.result.sticker) thumbTelegramId = tRes.result.sticker.file_id;
-                    }
-                } catch (e) { console.error("Gagal upload thumb", e); }
-            }
-        }
-
-        sText.innerHTML = `${prefix}Memulai upload...`;
-        const totalChunks = Math.ceil(fileInput.size / CHUNK_SIZE); 
-        const uploadedChunks = []; 
-        let bytesSoFar = 0; 
-        let uploadFailed = false;
-        let fileStartTime = Date.now(); 
-
-        // ==========================================
-        // FIX #8: RETRY PER-CHUNK LINTAS WORKER (biar file besar -- yang
-        // otomatis jadi BANYAK chunk -- gak langsung gagal total cuma gara2
-        // 1 chunk kena error sesaat di 1 Worker (limit/timeout/hiccup
-        // jaringan). Sebelumnya: 1 chunk gagal -> SELURUH upload file itu
-        // langsung dibatalkan (isUploadCancelled=true), padahal chunk lain
-        // sebelumnya sudah berhasil dan Worker cadangan mungkin sehat2 saja.
-        // Sekarang: tiap chunk dicoba ke SEMUA Worker di pool secara
-        // bergiliran (bukan acak, supaya gak kebetulan balik ke Worker yang
-        // baru gagal) + jeda (backoff) yang makin lama tiap percobaan.
-        // Chunk baru benar2 dianggap gagal (dan upload file ini dihentikan)
-        // kalau SEMUA Worker sudah dicoba dan semuanya tetap gagal.
-        // ==========================================
-        const CHUNK_MAX_ATTEMPTS = Math.max(3, WORKER_POOL.length * 2); // tiap worker dapat >=2 kesempatan
-        for (let i = 0; i < totalChunks; i++) {
-            if (isUploadCancelled) break;
-            let chunkBlob = fileInput.slice(i * CHUNK_SIZE, Math.min((i + 1) * CHUNK_SIZE, fileInput.size));
-
-            // PATCH: WORKAROUND BUG SAFARI/WEBKIT -- file yang dipilih dari
-            // Photo Library (bukan app Files) kadang size-nya kebaca BENAR di
-            // JS, tapi saat Blob aslinya di-stream ulang oleh XHR ke dalam
-            // body FormData, isinya gagal ke-attach dengan sempurna (server
-            // terima bagian dokumen KOSONG walau ukurannya normal di app).
-            // Fix-nya: paksa baca semua byte-nya ke memori (arrayBuffer) DI
-            // SINI, lalu bungkus jadi Blob baru murni-dari-memori sebelum
-            // dipakai berulang di FormData -- ini menghindari Safari mesti
-            // "streaming lazy" dari referensi asset asli tiap kali dikirim.
-            try {
-                const buf = await chunkBlob.arrayBuffer();
-                if (!buf || buf.byteLength === 0) {
-                    throw new Error('Bagian file ini terbaca 0 byte oleh browser (kemungkinan masalah akses file di iOS/Safari). Coba pilih ulang filenya, atau buka dulu file aslinya di app Foto/Files sebelum upload.');
-                }
-                chunkBlob = new Blob([buf], { type: chunkBlob.type || 'application/octet-stream' });
-            } catch (readErr) {
-                isUploadCancelled = true;
-                uploadFailed = true;
-                lastUploadFailureMessage = readErr.message || 'Gagal membaca isi file dari device.';
-                sText.innerHTML = `<span style="color:var(--danger);">${lastUploadFailureMessage}</span>`;
-                showToast(`Upload gagal: ${lastUploadFailureMessage}`, true);
-                break;
-            }
-
-            const caption = `[${uniqueId}] ${customName}.${format} - Part ${i + 1}/${totalChunks}`;
-
-            let chunkResult = null;
-            let chunkErr = null;
-            for (let attempt = 0; attempt < CHUNK_MAX_ATTEMPTS; attempt++) {
-                if (isUploadCancelled) break;
-                // FormData harus dibuat baru tiap percobaan -- body-nya (blob)
-                // sekali "terpakai" oleh 1 request XHR, jadi kalau dipakai
-                // ulang lintas percobaan sebagian browser bisa kirim body
-                // kosong/rusak di percobaan kedua dst.
-                const fd = new FormData();
-                fd.append('chat_id', TELEGRAM_CHAT_ID);
-                fd.append('document', chunkBlob, `part_${i + 1}.dat`);
-                fd.append('caption', caption);
-                // Bergiliran round-robin ke tiap Worker di pool (attempt 0 -> worker[0],
-                // attempt 1 -> worker[1], dst, lalu ulang lagi dari awal).
-                const targetWorker = WORKER_POOL[attempt % WORKER_POOL.length];
-
-                if (attempt > 0) sText.innerHTML = `${prefix}Percobaan ulang chunk ${i + 1}/${totalChunks} (server ${(attempt % WORKER_POOL.length) + 1}/${WORKER_POOL.length})...`;
-
-                try {
-                    chunkResult = await uploadChunkXHR(fd, bytesSoFar, fileInput.size, (loaded, total) => {
-                        let percent = ((loaded / total) * 100).toFixed(1);
-                        if (percent > 100) percent = 100;
-
-                        if (progressBar) progressBar.style.width = percent + '%';
-                        if (percentEl) percentEl.innerText = percent + '%';
-                        if (byteStatusEl) byteStatusEl.innerText = `${formatBytes(loaded)} / ${formatBytes(total)}`;
-
-                        let now = Date.now();
-                        let elapsed = (now - fileStartTime) / 1000;
-                        let etaString = "Menghitung...";
-
-                        if (elapsed > 0.5 && loaded > 0) {
-                            let speed = loaded / elapsed;
-                            let remaining = total - loaded;
-                            let eta = remaining / speed;
-                            if (eta !== Infinity && !isNaN(eta)) {
-                                let mins = Math.floor(eta / 60);
-                                let secs = Math.floor(eta % 60);
-                                etaString = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
-                            }
-                        }
-
-                        // UPDATE UI TEXT: Menampilkan estimasi sederhana dan update nama (jika berpindah file)
-                        if (fileNameText) fileNameText.innerText = customName;
-                        sText.innerHTML = `${prefix}Estimasi selesai: <b style="color:var(--primary);">${etaString}</b>`;
-                    }, targetWorker);
-                    chunkErr = null;
-                    break; // sukses, keluar dari loop retry chunk ini
-                } catch (e) {
-                    chunkErr = e;
-                    if (attempt < CHUNK_MAX_ATTEMPTS - 1 && !isUploadCancelled) {
-                        // Backoff bertahap (0.6s, 1.2s, 1.8s, ...) supaya kalau
-                        // penyebabnya server lagi sibuk/limit sesaat, dikasih
-                        // waktu pulih dulu sebelum dicoba lagi.
-                        await sleep(600 * (attempt + 1));
-                    }
-                }
-            }
-
-            if (chunkErr) {
-                isUploadCancelled = true;
-                uploadFailed = true;
-                lastUploadFailureMessage = chunkErr.message; // FIX: simpan alasan asli, jangan ketutup pesan "dibatalkan" generik di bawah
-                sText.innerHTML = `<span style="color:var(--danger);"><span class="material-symbols-rounded" style="vertical-align:middle; font-size:18px;">error</span> Gagal (chunk ${i + 1}/${totalChunks} sudah dicoba ke semua server): ${chunkErr.message}. Proses dihentikan.</span>`;
-                showToast(`Upload gagal dan dihentikan: ${chunkErr.message}`, true);
-                break;
-            }
-
-            uploadedChunks.push({ part: i + 1, telegramFileId: chunkResult.result.document.file_id });
-            bytesSoFar += chunkBlob.size;
-        }
-
-        if (isUploadCancelled || uploadFailed) break; 
-
-        sText.innerHTML = `${prefix}Menyimpan metadata...`;
-        let metaRes;
-        if (sharedUploadActive) {
-            metaRes = await saveMetadataViaForm({ fileId: uniqueId, customName: customName, originalName: fileInput.name, format: format, folder: folderTarget, fileSize: fileInput.size, totalChunks: totalChunks, chunks: uploadedChunks, thumbId: thumbTelegramId, shareId: sharedUploadShareId, viewerUid: sharedUploadViewerUid }, 'shared_save_metadata');
-            if (metaRes && metaRes.success !== false && !sharedContentsCache.files.some(f => f.id === uniqueId)) sharedContentsCache.files.push({ id: uniqueId, name: customName, originalName: fileInput.name, format: format, folder: folderTarget, size: fileInput.size, thumbId: thumbTelegramId });
-        } else {
-            metaRes = await saveMetadataViaForm({ fileId: uniqueId, customName: customName, originalName: fileInput.name, format: format, folder: folderTarget, fileSize: fileInput.size, totalChunks: totalChunks, chunks: uploadedChunks, thumbId: thumbTelegramId, ownerId: currentOwnerId });
-            if (metaRes && metaRes.success !== false && !stateArray.active.some(f => f.id === uniqueId)) stateArray.active.push({ id: uniqueId, name: customName, originalName: fileInput.name, format: format, folder: folderTarget, size: fileInput.size, thumbId: thumbTelegramId });
-        }
-        // PATCH: dulu saveMetadataViaForm SELALU dianggap sukses (teknik lama gak
-        // bisa deteksi gagal). Sekarang beneran bisa tau kalau gagal -- jadi file
-        // yang metadatanya gagal tersimpan gak boleh ikut dihitung "berhasil".
-        if (!metaRes || metaRes.success === false) {
-            showToast(`Gagal menyimpan metadata untuk ${customName}: ${(metaRes && metaRes.message) || 'semua server penuh/limit'}.`, true);
-            uploadQueue.shift();
+            let ok = false;
+            try { ok = await processQueueItem(item, myIndex + 1, totalFiles); }
+            catch (e) { ok = false; item.statusText = (e && e.message) || 'Gagal.'; }
+            item.status = ok ? 'done' : 'error';
+            if (ok) successCount++;
             renderUploadQueue();
-            continue;
+            updateAggregateUploadUI();
         }
-        
-        successCount++;
-        uploadQueue.shift();
-        renderUploadQueue();
     }
 
-    if (isUploadCancelled) { 
-        // FIX: dulu selalu bilang "dibatalkan" walau sebenarnya GAGAL (mis. koneksi
-        // putus di tengah Safari) -- user jadi ngira dia sendiri yang batalin,
-        // padahal itu kegagalan jaringan/CORS/server. Sekarang bedakan pesannya.
-        showToast(lastUploadFailureMessage ? `Upload berhenti: ${lastUploadFailureMessage}` : "Proses upload dibatalkan.", true); 
+    const workerCount = Math.min(MAX_CONCURRENT_UPLOADS, uploadQueue.length);
+    const runners = [];
+    for (let w = 0; w < workerCount; w++) runners.push(worker());
+    await Promise.all(runners);
+
+    if (isUploadCancelled) {
+        showToast(lastUploadFailureMessage ? `Upload berhenti: ${lastUploadFailureMessage}` : "Proses upload dibatalkan.", true);
         lastUploadFailureMessage = null;
-        box.style.display = 'none'; btn.disabled = false; isUploadInProgress = false; 
+        box.style.display = 'none'; btn.disabled = false; isUploadInProgress = false;
         renderUploadQueue();
-    }
-    else {
-        sText.innerHTML = `Selesai! <b>${successCount} dari ${totalFiles}</b> berkas berhasil diunggah.`;
+    } else {
+        const failCount = totalFiles - successCount;
+        const sText = document.getElementById('upload-status-text');
+        sText.innerHTML = failCount > 0
+            ? `Selesai! <b>${successCount} dari ${totalFiles}</b> berkas berhasil, ${failCount} gagal.`
+            : `Selesai! <b>${successCount} dari ${totalFiles}</b> berkas berhasil diunggah.`;
         if (sharedUploadActive) {
             if (!sharedIsSelecting) renderSharedFolderBody({ item: { name: sharedCurrentFolderName, contents: sharedContentsCache }, ownerId: pendingShareResolved && pendingShareResolved.ownerId, ownerName: pendingShareResolved && pendingShareResolved.ownerName, role: sharedUploadFabRole }, sharedUploadShareId, sharedViewerUid, sharedCurrentPath);
         } else {
@@ -3110,6 +2984,226 @@ async function startMultiUpload() {
         }
         setTimeout(() => { closeUploadModal(); box.style.display = 'none'; btn.disabled = false; uploadQueue = []; isUploadInProgress = false; }, 1400);
     }
+}
+
+// Logika 1 file (thumbnail -> chunk upload dgn retry lintas-worker -> simpan
+// metadata), diekstrak dari startMultiUpload lama. Dipanggil dari beberapa
+// "worker" sekaligus di atas -- jadi TIDAK BOLEH menulis ke elemen UI tunggal
+// (dulu sText/percentEl/fileNameText global); semua status/progress ditulis
+// ke kartu milik file ini sendiri lewat item & updateQueueItemProgress(qid,..).
+// Return true = sukses, false = gagal (file lain di antrian tetap lanjut).
+async function processQueueItem(item, currentIdx, totalFiles) {
+    const fileInput = item.file;
+    const customName = item.customName.trim() || fileInput.name.split('.')[0];
+    const format = item.ext.toLowerCase();
+    const folderTarget = sharedUploadActive ? sharedCurrentPath : ((currentTab === 'home') ? currentPath : '');
+    const uniqueId = 'FILE_' + Date.now() + '_' + item.qid;
+    const prefix = totalFiles > 1 ? `[${currentIdx}/${totalFiles}] ` : '';
+    let itemCancelled = false; // FIX: dulu 1 chunk gagal total (semua worker dicoba & tetap gagal)
+                                // langsung men-set isUploadCancelled GLOBAL, jadi ikut menghentikan
+                                // file lain yang sedang berbarengan diupload. Sekarang kegagalan
+                                // fatal hanya menghentikan FILE INI -- file lain tetap lanjut.
+
+    const setStatusText = (txt) => { item.statusText = txt; updateQueueItemProgress(item.qid, item.progressPercent, txt); };
+    setStatusText(`${prefix}Menyiapkan...`);
+
+    let thumbTelegramId = null;
+
+    // =====================================
+    // PENANGANAN THUMBNAIL VIDEO
+    // =====================================
+    if (fileInput.type.startsWith('video/') || VIDEO_EXTENSIONS.has(format)) {
+        setStatusText(`${prefix}Membuat thumbnail video...`);
+        // Kalau preview kartu di antrian SUDAH digenerate saat file dipilih
+        // (lihat prepareQueueItemPreview), pakai ulang blob yang sama persis
+        // -- tidak perlu capture frame video 2x untuk hal yang identik.
+        let thumbBlob = item.thumbBlob || await generateVideoThumbnail(fileInput);
+
+        if (isUploadCancelled) return false;
+
+        if (thumbBlob) {
+            const fdThumb = new FormData();
+            fdThumb.append('chat_id', TELEGRAM_CHAT_ID);
+            fdThumb.append('document', thumbBlob, 'cover.dat');
+
+            const activeWorker = getRandomWorker();
+            const uploadUrl = `${activeWorker}/upload?token=${WORKER_PASSWORD}&bot_token=${TELEGRAM_BOT_TOKEN}`;
+            try {
+                const tRes = await fetch(uploadUrl, { method: 'POST', body: fdThumb }).then(r => r.json());
+                if (tRes.ok) {
+                    if (tRes.result.document) thumbTelegramId = tRes.result.document.file_id;
+                    else if (tRes.result.sticker) thumbTelegramId = tRes.result.sticker.file_id;
+                }
+            } catch (e) { console.error("Gagal upload thumb", e); }
+        }
+    }
+    // =====================================
+    // PENANGANAN THUMBNAIL GAMBAR
+    // =====================================
+    else if (IMAGE_EXTENSIONS.has(format)) {
+        setStatusText(`${prefix}Menyiapkan preview image...`);
+        let previewBlob = null;
+        let extractedJpegFallback = null;
+
+        try {
+            previewBlob = await Promise.race([
+                convertImageToWebP(fileInput, 5 * 1024 * 1024),
+                new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 9000))
+            ]);
+        } catch (e) { previewBlob = null; }
+
+        if (!previewBlob && ['cr2', 'nef', 'arw', 'dng', 'raw', 'rw2', 'orf', 'pef', 'srw', 'heic', 'heif'].includes(format)) {
+            try {
+                const u8 = await extractRawEmbeddedPreview(fileInput);
+                if (u8) {
+                    const extracted = new Blob([u8], { type: 'image/jpeg' });
+                    extractedJpegFallback = extracted;
+                    try {
+                        previewBlob = await Promise.race([
+                            convertImageToWebP(extracted, 5 * 1024 * 1024),
+                            new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 9000))
+                        ]);
+                    } catch (e) { previewBlob = null; }
+                }
+            } catch (e) { /* memang tidak ada preview JPEG apa pun yang bisa ditemukan di file ini */ }
+        }
+
+        if (!previewBlob && extractedJpegFallback) previewBlob = extractedJpegFallback;
+
+        if (previewBlob) {
+            const fdThumb = new FormData();
+            fdThumb.append('chat_id', TELEGRAM_CHAT_ID);
+            fdThumb.append('document', previewBlob, 'cover.dat');
+
+            const activeWorker = getRandomWorker();
+            const uploadUrl = `${activeWorker}/upload?token=${WORKER_PASSWORD}&bot_token=${TELEGRAM_BOT_TOKEN}`;
+            try {
+                const tRes = await fetch(uploadUrl, { method: 'POST', body: fdThumb }).then(r => r.json());
+                if (tRes.ok) {
+                    if (tRes.result.document) thumbTelegramId = tRes.result.document.file_id;
+                    else if (tRes.result.sticker) thumbTelegramId = tRes.result.sticker.file_id;
+                }
+            } catch (e) { console.error("Gagal upload thumb", e); }
+        }
+    }
+
+    if (isUploadCancelled) return false;
+
+    setStatusText(`${prefix}Memulai upload...`);
+    const totalChunks = Math.ceil(fileInput.size / CHUNK_SIZE);
+    const uploadedChunks = [];
+    let bytesSoFar = 0;
+    let fileStartTime = Date.now();
+
+    // ==========================================
+    // FIX #8: RETRY PER-CHUNK LINTAS WORKER (lihat penjelasan panjang di versi
+    // lama) -- perilakunya dipertahankan persis sama di sini, cuma dipindah
+    // jadi milik 1 file/1 pemanggilan fungsi ini.
+    // ==========================================
+    const CHUNK_MAX_ATTEMPTS = Math.max(3, WORKER_POOL.length * 2);
+    for (let i = 0; i < totalChunks; i++) {
+        if (isUploadCancelled || itemCancelled) break;
+        let chunkBlob = fileInput.slice(i * CHUNK_SIZE, Math.min((i + 1) * CHUNK_SIZE, fileInput.size));
+
+        // PATCH: WORKAROUND BUG SAFARI/WEBKIT (lihat penjelasan versi lama) --
+        // paksa baca semua byte ke memori dulu sebelum dipakai di FormData.
+        try {
+            const buf = await chunkBlob.arrayBuffer();
+            if (!buf || buf.byteLength === 0) {
+                throw new Error('Bagian file ini terbaca 0 byte oleh browser (kemungkinan masalah akses file di iOS/Safari). Coba pilih ulang filenya, atau buka dulu file aslinya di app Foto/Files sebelum upload.');
+            }
+            chunkBlob = new Blob([buf], { type: chunkBlob.type || 'application/octet-stream' });
+        } catch (readErr) {
+            itemCancelled = true;
+            item.statusText = readErr.message || 'Gagal membaca isi file dari device.';
+            setStatusText(item.statusText);
+            showToast(`${customName}: ${item.statusText}`, true);
+            break;
+        }
+
+        const caption = `[${uniqueId}] ${customName}.${format} - Part ${i + 1}/${totalChunks}`;
+
+        let chunkResult = null;
+        let chunkErr = null;
+        for (let attempt = 0; attempt < CHUNK_MAX_ATTEMPTS; attempt++) {
+            if (isUploadCancelled || itemCancelled) break;
+            // FormData harus dibuat baru tiap percobaan -- lihat catatan versi lama.
+            const fd = new FormData();
+            fd.append('chat_id', TELEGRAM_CHAT_ID);
+            fd.append('document', chunkBlob, `part_${i + 1}.dat`);
+            fd.append('caption', caption);
+            const targetWorker = WORKER_POOL[attempt % WORKER_POOL.length];
+
+            if (attempt > 0) setStatusText(`${prefix}Percobaan ulang chunk ${i + 1}/${totalChunks} (server ${(attempt % WORKER_POOL.length) + 1}/${WORKER_POOL.length})...`);
+
+            try {
+                chunkResult = await uploadChunkXHR(fd, bytesSoFar, fileInput.size, (loaded, total) => {
+                    let percent = (loaded / total) * 100;
+                    if (percent > 100) percent = 100;
+                    percent = Number(percent.toFixed(1));
+                    item.progressPercent = percent;
+                    item.loadedBytes = loaded;
+
+                    let now = Date.now();
+                    let elapsed = (now - fileStartTime) / 1000;
+                    let etaString = "Menghitung...";
+                    if (elapsed > 0.5 && loaded > 0) {
+                        let speed = loaded / elapsed;
+                        let remaining = total - loaded;
+                        let eta = remaining / speed;
+                        if (eta !== Infinity && !isNaN(eta)) {
+                            let mins = Math.floor(eta / 60);
+                            let secs = Math.floor(eta % 60);
+                            etaString = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+                        }
+                    }
+                    updateQueueItemProgress(item.qid, percent, `${prefix}${percent}% • ETA ${etaString}`);
+                    updateAggregateUploadUI();
+                }, targetWorker);
+                chunkErr = null;
+                break; // sukses, keluar dari loop retry chunk ini
+            } catch (e) {
+                chunkErr = e;
+                if (attempt < CHUNK_MAX_ATTEMPTS - 1 && !isUploadCancelled && !itemCancelled) {
+                    await sleep(600 * (attempt + 1));
+                }
+            }
+        }
+
+        if (chunkErr) {
+            itemCancelled = true;
+            item.statusText = `Gagal (chunk ${i + 1}/${totalChunks}, sudah dicoba semua server): ${chunkErr.message}`;
+            setStatusText(item.statusText);
+            showToast(`${customName}: upload gagal dan dihentikan (${chunkErr.message})`, true);
+            break;
+        }
+
+        uploadedChunks.push({ part: i + 1, telegramFileId: chunkResult.result.document.file_id });
+        bytesSoFar += chunkBlob.size;
+    }
+
+    if (isUploadCancelled) return false;
+    if (itemCancelled) return false;
+
+    setStatusText(`${prefix}Menyimpan metadata...`);
+    let metaRes;
+    if (sharedUploadActive) {
+        metaRes = await saveMetadataViaForm({ fileId: uniqueId, customName: customName, originalName: fileInput.name, format: format, folder: folderTarget, fileSize: fileInput.size, totalChunks: totalChunks, chunks: uploadedChunks, thumbId: thumbTelegramId, shareId: sharedUploadShareId, viewerUid: sharedUploadViewerUid }, 'shared_save_metadata');
+        if (metaRes && metaRes.success !== false && !sharedContentsCache.files.some(f => f.id === uniqueId)) sharedContentsCache.files.push({ id: uniqueId, name: customName, originalName: fileInput.name, format: format, folder: folderTarget, size: fileInput.size, thumbId: thumbTelegramId });
+    } else {
+        metaRes = await saveMetadataViaForm({ fileId: uniqueId, customName: customName, originalName: fileInput.name, format: format, folder: folderTarget, fileSize: fileInput.size, totalChunks: totalChunks, chunks: uploadedChunks, thumbId: thumbTelegramId, ownerId: currentOwnerId });
+        if (metaRes && metaRes.success !== false && !stateArray.active.some(f => f.id === uniqueId)) stateArray.active.push({ id: uniqueId, name: customName, originalName: fileInput.name, format: format, folder: folderTarget, size: fileInput.size, thumbId: thumbTelegramId });
+    }
+
+    if (!metaRes || metaRes.success === false) {
+        item.statusText = `Metadata gagal disimpan: ${(metaRes && metaRes.message) || 'semua server penuh/limit'}`;
+        setStatusText(item.statusText);
+        showToast(`Gagal menyimpan metadata untuk ${customName}: ${(metaRes && metaRes.message) || 'semua server penuh/limit'}.`, true);
+        return false;
+    }
+
+    item.progressPercent = 100;
+    return true;
 }
 
 function openCreateFolderModal() { document.getElementById('folder-modal').style.display = 'flex'; }
@@ -3419,6 +3513,23 @@ async function authenticateToOwnerAccount(ownerAccount) {
     return true;
 }
 
+// FIX: spinner loading awal shared-link (terutama link berformat file
+// tunggal) dulu dibuat pakai div height:60vh yang cuma center DI DALAM
+// dirinya sendiri, dan itu ditaruh di bawah padding .shared-body (24px)
+// + tinggi .shared-header -- hasilnya spinner kelihatan nempel ke atas,
+// bukan dead-center layar. Sekarang posisinya position:fixed dan tingginya
+// dihitung dari tinggi header yang SEBENARNYA dirender (bukan ditebak),
+// jadi selalu pas di tengah area yang kelihatan, di semua ukuran layar.
+function showSharedFullscreenLoader(text) {
+    const headerEl = document.querySelector('#shared-view .shared-header');
+    const headerH = headerEl ? headerEl.getBoundingClientRect().height : 0;
+    document.getElementById('shared-body').innerHTML = `
+        <div style="position:fixed; left:0; right:0; top:${headerH}px; bottom:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; background:var(--bg-main); z-index:1;">
+            <div class="spinner"></div>
+            <p style="color:var(--text-secondary); font-size:13.5px;">${escapeHtml(text)}</p>
+        </div>`;
+}
+
 async function handleSharedLink(code) {
     pendingShareCode = code;
     sharedSelectedIds.clear(); sharedIsSelecting = false;
@@ -3426,7 +3537,7 @@ async function handleSharedLink(code) {
     document.getElementById('app-layout').style.display = 'none';
     document.getElementById('shared-view').style.display = 'flex';
     document.getElementById('shared-breadcrumb').style.display = 'none';
-    document.getElementById('shared-body').innerHTML = `<div style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:60vh; gap:12px;"><div class="spinner"></div><p style="color:var(--text-secondary); font-size:13.5px;">Memuat tautan yang dibagikan...</p></div>`;
+    showSharedFullscreenLoader('Memuat tautan yang dibagikan...');
 
     const activeAcc = getActiveStoredAccount();
     preShareOwnerId = activeAcc ? activeAcc.ownerId : '';
@@ -4736,6 +4847,16 @@ async function drawAudioWave(container, audioUrl) {
 
 async function renderPreviewContent(url, ext, container, blob) {
     ext = (ext||'').toLowerCase();
+    // Transisi morph/fade dari spinner loading ke konten pratinjau final.
+    // Class ditempel di container (bukan konten di dalamnya) supaya tetap
+    // jalan apa pun jenis kontennya (gambar/video/pdf/dst) yang diisi di
+    // bawah oleh masing-masing cabang; reflow paksa dulu biar animasi selalu
+    // restart walau container ini sebelumnya sudah pernah dipakai.
+    if (container) {
+        container.classList.remove('fade-in-content');
+        void container.offsetWidth;
+        container.classList.add('fade-in-content');
+    }
     try {
         if (IMAGE_EXTENSIONS.has(ext)) {
             let displayUrl = url;
