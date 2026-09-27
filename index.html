@@ -202,11 +202,9 @@
                 <a class="nav-item" id="nav-trash" onclick="switchTab('trash')">
                     <span style="display:flex; align-items:center; gap:10px;"><span class="material-symbols-rounded">delete</span>Sampah</span>
                 </a>
-
-                <hr style="border:0; border-top:1px solid var(--border-color); margin: 12px 0;">
-                <div class="folder-section-title" style="padding: 0 8px;">Dibagikan Kepada Anda</div>
-                <!-- Tambahkan flex: 1 dan overflow-y supaya list ini yang scrollable jika sangat panjang -->
-                <div id="sidebar-shared-list" style="margin-bottom: 8px; flex: 1; overflow-y: auto; min-height: 100px;"></div>
+                <a class="nav-item" id="nav-shared" onclick="switchTab('shared')">
+                    <span style="display:flex; align-items:center; gap:10px;"><span class="material-symbols-rounded">folder_shared</span>Dibagikan</span>
+                </a>
 
             </aside>
 
@@ -263,6 +261,9 @@
             <div class="bottom-nav-item" id="bnav-trash" onclick="switchTab('trash')">
                 <span class="material-symbols-rounded">delete</span><span>Sampah</span>
             </div>
+            <div class="bottom-nav-item" id="bnav-shared" onclick="switchTab('shared')">
+                <span class="material-symbols-rounded">folder_shared</span><span>Dibagikan</span>
+            </div>
         </nav>
     </div>
 
@@ -297,9 +298,26 @@
         <div class="shared-breadcrumb" id="shared-breadcrumb" style="display:none;"></div>
         <div class="shared-body" id="shared-body"></div>
 
-        <button class="fab-btn" id="shared-upload-fab" style="display:none;" onclick="openSharedUploadModal()" title="Upload File">
+        <button class="fab-btn" id="shared-upload-fab" style="display:none;" onclick="openSharedFabMenu()" title="Tambah">
             <span class="material-symbols-rounded" style="font-size: 26px;">add</span>
         </button>
+    </div>
+
+    <div class="modal" id="shared-fab-menu-modal">
+        <div class="modal-content" style="max-width: 320px; padding: 16px;">
+            <div class="modal-header" style="margin-bottom: 8px;">
+                <h3>Pilih Aksi</h3>
+                <button class="icon-btn" onclick="closeSharedFabMenu()"><span class="material-symbols-rounded">close</span></button>
+            </div>
+            <div style="display: flex; flex-direction: column; gap: 2px;">
+                <div class="action-menu-item" onclick="closeSharedFabMenu(); openSharedUploadModal();">
+                    <span class="material-symbols-rounded" style="color:var(--primary);">upload_file</span><span>Upload File</span>
+                </div>
+                <div class="action-menu-item" onclick="closeSharedFabMenu(); sharedCreateFolderPrompt();">
+                    <span class="material-symbols-rounded" style="color:var(--primary);">create_new_folder</span><span>Buat Folder Baru</span>
+                </div>
+            </div>
+        </div>
     </div>
 
     <div class="modal" id="custom-confirm-modal" style="z-index: 9999;">
