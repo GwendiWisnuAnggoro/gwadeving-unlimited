@@ -528,7 +528,7 @@
             </div>
             <input type="file" id="hidden-multi-file-input" multiple="multiple" accept="*/*" style="position: absolute; top: -9999px; left: -9999px;" onchange="handleMultiFileSelect(this)">
 
-            <div style="border: 1.5px dashed var(--border-color); border-radius: var(--radius-sm); padding: 16px; text-align: center; margin-bottom: 12px; cursor: pointer; transition: 0.2s; background: var(--surface-bg);" onclick="document.getElementById('hidden-multi-file-input').click()" onmouseover="this.style.borderColor='var(--primary)'; this.style.background='var(--primary-light)'" onmouseout="this.style.borderColor='var(--border-color)'; this.style.background='var(--surface-bg)'">
+            <div id="upload-dropzone" style="border: 1.5px dashed var(--border-color); border-radius: var(--radius-sm); padding: 16px; text-align: center; margin-bottom: 12px; cursor: pointer; transition: 0.2s; background: var(--surface-bg);" onclick="document.getElementById('hidden-multi-file-input').click()" onmouseover="this.style.borderColor='var(--primary)'; this.style.background='var(--primary-light)'" onmouseout="this.style.borderColor='var(--border-color)'; this.style.background='var(--surface-bg)'">
                 <span class="material-symbols-rounded" style="font-size: 28px; color: var(--primary); margin-bottom: 4px;">upload_file</span>
                 <p style="font-size: 13px; font-weight: 500; color: var(--text-secondary);">Klik untuk memilih file</p>
             </div>
