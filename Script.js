@@ -282,6 +282,12 @@ let sharedIsOwnerView = false;
 let sharedFileShareRole = 'view';
 let sharedRootItem = null;
 let sharedCurrentPath = '';
+// FIX BUG "STUCK SAAT RENAME/PRIVASI DIUBAH SAAT SEDANG DIBUKA": posisi
+// browsing di dalam folder share disimpan sebagai SEGMEN NAMA relatif dari
+// root (bukan path absolut). Path absolut basi kalau root/leluhurnya
+// di-rename dari perangkat lain -- segmen nama relatif tidak, karena root
+// selalu dihitung ulang segar tiap kali (lihat navigateSharedTo & polling).
+let sharedPathSegments = [];
 let sharedPollTimer = null;
 let sharedLoginPromptDismissed = false;
 let sharedSelectedIds = new Set();
@@ -2597,7 +2603,16 @@ function handleThumbLoadError(imgEl, containerId, iconName) {
 // ==========================================
 // UPLOAD MULTI-FILE SYSTEM
 // ==========================================
-function openUploadModal() { isUploadCancelled = false; uploadQueue = []; uploadDispatchList = []; renderUploadQueue(); document.getElementById('upload-modal').style.display = 'flex'; }
+function openUploadModal() {
+    isUploadCancelled = false; uploadQueue = []; uploadDispatchList = []; renderUploadQueue();
+    // Jaga-jaga: pastikan dropzone & tombol Upload Semua selalu tampil lagi
+    // tiap kali modal ini dibuka -- kalau sesi sebelumnya sempat ditutup
+    // paksa (tombol X) di tengah upload, keduanya bisa ketinggalan
+    // tersembunyi kalau tidak direset eksplisit di sini.
+    const btn = document.getElementById('btn-upload'); if (btn) { btn.style.display = ''; btn.disabled = false; }
+    const dropzone = document.getElementById('upload-dropzone'); if (dropzone) dropzone.style.display = '';
+    document.getElementById('upload-modal').style.display = 'flex';
+}
 function closeUploadModal() {
     isUploadCancelled = true;
     // Batalkan SEMUA upload yang sedang berjalan bersamaan (bukan cuma 1 xhr seperti dulu).
@@ -3053,6 +3068,16 @@ async function startMultiUpload() {
 
     const btn = document.getElementById('btn-upload');
     btn.disabled = true;
+    // FIX UI: dulu tombol ini cuma di-disable (tetap kelihatan abu-abu), dan
+    // area "Klik untuk memilih file" tetap aktif -- pengguna masih bisa
+    // menambah file baru di tengah proses upload yang berjalan, bikin
+    // antrean & progress campur aduk. Sekarang KEDUANYA disembunyikan total
+    // begitu upload dimulai, dan baru dimunculkan lagi setelah SEMUA file di
+    // antrean ini selesai diproses (baik semuanya sukses, sebagian gagal,
+    // maupun dibatalkan) -- lihat ujung startMultiUpload().
+    btn.style.display = 'none';
+    const dropzone = document.getElementById('upload-dropzone');
+    if (dropzone) dropzone.style.display = 'none';
     const box = document.getElementById('upload-progress-box');
     box.style.display = 'block';
 
@@ -3095,10 +3120,15 @@ async function startMultiUpload() {
     await Promise.all(runners);
     uploadDispatchList = [];
 
+    // Semua file di antrean ini sudah selesai diproses -- munculkan lagi UI
+    // pemilihan file & tombol upload (lihat catatan FIX UI di awal fungsi).
+    btn.style.display = ''; btn.disabled = false;
+    if (dropzone) dropzone.style.display = '';
+
     if (isUploadCancelled) {
         showToast(lastUploadFailureMessage ? `Upload berhenti: ${lastUploadFailureMessage}` : "Proses upload dibatalkan.", true);
         lastUploadFailureMessage = null;
-        box.style.display = 'none'; btn.disabled = false; isUploadInProgress = false;
+        box.style.display = 'none'; isUploadInProgress = false;
         renderUploadQueue();
     } else {
         const failCount = totalFiles - successCount;
@@ -3112,7 +3142,7 @@ async function startMultiUpload() {
             renderUI();
             await syncData();
         }
-        btn.disabled = false; isUploadInProgress = false;
+        isUploadInProgress = false;
         if (failCount > 0) {
             // Ada file gagal/dibatalkan -- modal TETAP terbuka supaya pengguna
             // bisa menekan tombol "Ulangi" per file (lihat retryQueueItem),
@@ -3668,6 +3698,23 @@ async function authenticateToOwnerAccount(ownerAccount) {
 // bukan dead-center layar. Sekarang posisinya position:fixed dan tingginya
 // dihitung dari tinggi header yang SEBENARNYA dirender (bukan ditebak),
 // jadi selalu pas di tengah area yang kelihatan, di semua ukuran layar.
+// FIX BUG "NAVBAR HILANG SETELAH BUKA LINK FILE/FOLDER YANG DIBAGIKAN":
+// #shared-view adalah kontainer scroll-nya sendiri (overflow-y:auto), dan
+// .shared-header ada DI DALAM alur scroll itu (bukan position:sticky/fixed).
+// Sebelumnya scrollTop kontainer ini TIDAK PERNAH direset -- kalau
+// sebelumnya pengguna sempat scroll ke bawah (mis. di tab/instance app yang
+// sama dipakai lagi untuk membuka link share lain), posisi scroll lama itu
+// terbawa terus, sehingga begitu konten baru dirender, header ada di atas
+// area yang sudah discroll lewat -- KELIHATAN hilang padahal cuma
+// tersembunyi di atas viewport. Dipanggil di setiap TITIK NAVIGASI (buka
+// link baru, pindah folder) -- BUKAN di setiap tick polling realtime,
+// supaya update dari perangkat lain tidak memaksa scroll pengguna balik ke
+// atas saat sedang membaca/scroll di tengah folder.
+function resetSharedViewScroll() {
+    const sv = document.getElementById('shared-view');
+    if (sv) sv.scrollTop = 0;
+}
+
 function showSharedFullscreenLoader(text) {
     const headerEl = document.querySelector('#shared-view .shared-header');
     const headerH = headerEl ? headerEl.getBoundingClientRect().height : 0;
@@ -3684,6 +3731,7 @@ async function handleSharedLink(code) {
     document.getElementById('login-view').style.display = 'none';
     document.getElementById('app-layout').style.display = 'none';
     document.getElementById('shared-view').style.display = 'flex';
+    resetSharedViewScroll();
     document.getElementById('shared-breadcrumb').style.display = 'none';
     showSharedFullscreenLoader('Memuat tautan yang dibagikan...');
 
@@ -3781,6 +3829,7 @@ async function handleSharedLink(code) {
 
     sharedRootItem = { path: res.item.path || '', name: res.item.name, itemType: res.itemType, ownerId: res.ownerId };
     sharedCurrentPath = res.item.path || '';
+    sharedPathSegments = []; // baru masuk lagi dari root
     updateSharedViewChrome();
 
     document.getElementById('shared-owner-banner').style.display = 'flex';
@@ -3789,6 +3838,7 @@ async function handleSharedLink(code) {
     // FIXED: Menggunakan sharedViewerUid bukan viewerUid
     if (res.itemType === 'file') renderSharedFileBody(res, code, sharedViewerUid);
     else renderSharedFolderBody(res, code, sharedViewerUid, res.item.path);
+    resetSharedViewScroll();
 
     startSharedPolling(code);
 }
@@ -4007,7 +4057,26 @@ function startSharedPolling(code) {
         // (gejala #2 di atas) yang gak pernah ketahuan dari sisi gagal/sukses.
         const forceLive = (tickCount % SHARED_FORCE_LIVE_EVERY_TICKS === 0);
 
-        let res = await getSharedDataFromSheets(code, sharedViewerUid, sharedCurrentPath, forceLive);
+        // FIX BUG "STUCK SAAT RENAME/PRIVASI DIUBAH SAAT SEDANG DIBUKA": sama
+        // seperti di navigateSharedTo() -- sharedCurrentPath (path absolut)
+        // basi begitu root/leluhurnya di-rename dari perangkat lain, dan query
+        // dengan path basi itu balas "berhasil tapi kosong", bukan error, jadi
+        // gak pernah tertangkap sebagai kegagalan. Di tick forceLive, root
+        // diresolusi ulang segar dulu (subPath=null -> selalu baca sh.itemId
+        // yang live) lalu digabung dengan sharedPathSegments (nama relatif)
+        // untuk mendapatkan path query yang BENAR-BENAR terkini. Tick biasa
+        // (bukan forceLive) tetap pakai path yang sudah diketahui supaya tidak
+        // menggandakan request tiap detik -- staleness-nya sendiri terkoreksi
+        // di tick forceLive berikutnya (maksimal ~4 detik).
+        let queryPath = sharedCurrentPath;
+        if (forceLive) {
+            const rootRes = await getSharedDataFromSheets(code, sharedViewerUid, null, true);
+            if (rootRes && rootRes.success && rootRes.authorized && rootRes.item) {
+                queryPath = sharedPathSegments.length ? (rootRes.item.path + '/' + sharedPathSegments.join('/')) : rootRes.item.path;
+            }
+        }
+
+        let res = await getSharedDataFromSheets(code, sharedViewerUid, queryPath, forceLive);
         
         // Kalau gviz (bukan forceLive) kelihatan gagal/dihapus/tidak authorized,
         // JANGAN langsung divonis -- konfirmasi SEKALI SAJA ke sumber live (GAS)
@@ -4068,7 +4137,11 @@ function startSharedPolling(code) {
         if (sharedDataSignature !== currentSig) {
             sharedDataSignature = currentSig;
             if (!sharedIsSelecting && res.itemType === 'folder') {
-                await renderSharedFolderBody(res, code, sharedViewerUid, sharedCurrentPath);
+                // Pakai queryPath (path yang BENAR-BENAR baru dipakai untuk ambil
+                // data ini), bukan sharedCurrentPath lama -- supaya begitu root
+                // ter-rename, sharedCurrentPath ikut ter-refresh benar mulai
+                // dari sini (dipakai lagi sebagai basis tick-tick berikutnya).
+                await renderSharedFolderBody(res, code, sharedViewerUid, queryPath);
                 // FIX REALTIME: kalau ada modal preview file yang lagi
                 // terbuka sambil browsing folder share ini, judulnya dulu
                 // TIDAK pernah ikut disinkronkan waktu pemilik rename/hapus
@@ -4174,26 +4247,85 @@ function renderSharedBreadcrumb(res, subPath) {
     el.style.display = 'flex';
     let html = `<span class="shared-owner-label" title="Dibagikan oleh ${escapeHtml(res.ownerName || 'Pengguna')}" style="cursor:default;color:var(--text-muted)">Dibagikan oleh ${escapeHtml(res.ownerName || 'Pengguna')}</span>`;
     const curParts = (subPath || '').split('/').filter(Boolean);
-    let accum = '';
+    // Segmen milik ROOT yang dibagikan sendiri (bisa lebih dari 1 kalau root-nya
+    // folder bertingkat) ada di awal curParts; sisanya adalah sharedPathSegments
+    // (hasil navigasi viewer sendiri di bawah root). Cuma segmen root PALING
+    // AKHIR dan segmen-segmen di bawahnya yang boleh diklik (lompat lewat
+    // jumpSharedBreadcrumb, berbasis nama relatif -- lihat catatan di
+    // sharedPathSegments) -- segmen INTERNAL nama root sendiri tidak boleh
+    // diklik karena viewer tidak boleh "naik" ke luar cakupan share.
+    const rootPartsCount = Math.max(curParts.length - sharedPathSegments.length, 0);
     curParts.forEach((seg, idx) => {
-        accum = accum ? accum + '/' + seg : seg;
         const isLast = idx === curParts.length - 1;
-        if (isLast) html += ` <span>/</span> <span>${seg}</span>`;
-        else { const p = accum; html += ` <span>/</span> <span class="crumb-link" onclick="navigateSharedTo('${p.replace(/'/g, "\\'")}')">${seg}</span>`; }
+        if (isLast) { html += ` <span>/</span> <span>${seg}</span>`; return; }
+        if (idx >= rootPartsCount - 1) {
+            const relDepth = idx - rootPartsCount; // -1 = balik ke root
+            html += ` <span>/</span> <span class="crumb-link" onclick="jumpSharedBreadcrumb(${relDepth})">${seg}</span>`;
+        } else {
+            html += ` <span>/</span> <span style="cursor:default;">${seg}</span>`;
+        }
     });
     el.innerHTML = html;
 }
-async function navigateSharedTo(path) {
+
+// Masuk satu level ke subfolder yang sedang ditampilkan (dipanggil dari kartu
+// folder). Disimpan sebagai NAMA relatif saja -- lihat catatan sharedPathSegments.
+function enterSharedSubfolder(segmentName) {
+    sharedPathSegments.push(segmentName);
+    navigateSharedTo();
+}
+// Lompat ke level tertentu lewat breadcrumb. depthIndex -1 = kembali ke root.
+function jumpSharedBreadcrumb(depthIndex) {
+    sharedPathSegments = depthIndex < 0 ? [] : sharedPathSegments.slice(0, depthIndex + 1);
+    navigateSharedTo();
+}
+
+// FIX BUG "STUCK SAAT RENAME/PRIVASI DIUBAH SAAT SEDANG DIBUKA": dulu fungsi
+// ini menerima & mengirim PATH ABSOLUT yang di-cache di klien (sharedCurrentPath)
+// langsung ke server sebagai subPath. Begitu pemilik me-rename folder root yang
+// sedang dibagikan (atau leluhurnya) dari perangkat lain, path absolut lama itu
+// tidak pernah cocok lagi dengan data terbaru -- server tetap balas "berhasil"
+// (bukan error!) tapi isi foldernya KOSONG karena tidak ada satu pun baris yang
+// diawali path basi itu. Klien tidak pernah tahu ada yang salah, jadi halaman
+// share kelihatan "stuck" (kosong selamanya) walau linknya sendiri valid.
+// Sekarang: root SELALU diresolusi ulang segar (subPath=null -> server baca
+// langsung dari sh.itemId, yang dijamin ikut ter-update tiap kali rename_folder_dir
+// jalan -- lihat backend.gs), lalu digabung dengan sharedPathSegments (nama
+// relatif, bukan path absolut) untuk membentuk path query yang sebenarnya.
+async function navigateSharedTo(forceLive) {
     showLoadingOverlay("Membuka folder...", false, false);
-    let r = await getSharedDataFromSheets(pendingShareCode, sharedViewerUid, path);
-    if (!r || !r.success || !r.authorized) {
-        // Sama seperti di startSharedPolling/handleSharedLink -- 1x konfirmasi
-        // live ke GAS sebelum divonis gagal, bukan cuma percaya gviz mentah2.
-        r = await getSharedDataFromSheets(pendingShareCode, sharedViewerUid, path, true);
+    let rootRes = await getSharedDataFromSheets(pendingShareCode, sharedViewerUid, null, !!forceLive);
+    if (!rootRes || !rootRes.success || !rootRes.authorized) {
+        rootRes = await getSharedDataFromSheets(pendingShareCode, sharedViewerUid, null, true);
+    }
+    if (!rootRes || !rootRes.success || !rootRes.item) {
+        hideLoadingOverlay();
+        if (rootRes && !rootRes.authorized) { renderSharedAuthWall(rootRes); return; }
+        renderShare404();
+        return;
+    }
+    if (!rootRes.authorized) { hideLoadingOverlay(); renderSharedAuthWall(rootRes); return; }
+
+    const freshRootPath = rootRes.item.path;
+    const targetPath = sharedPathSegments.length ? (freshRootPath + '/' + sharedPathSegments.join('/')) : freshRootPath;
+
+    let r = (targetPath === freshRootPath) ? rootRes : await getSharedDataFromSheets(pendingShareCode, sharedViewerUid, targetPath);
+    if (targetPath !== freshRootPath && (!r || !r.success || !r.authorized)) {
+        r = await getSharedDataFromSheets(pendingShareCode, sharedViewerUid, targetPath, true);
     }
     hideLoadingOverlay();
-    if (r && r.success && r.authorized) renderSharedFolderBody({ ownerId: pendingShareResolved.ownerId, ownerName: pendingShareResolved.ownerName, itemType: 'folder', item: r.item }, pendingShareCode, sharedViewerUid, path);
-    else if (r && (!r.success || !r.authorized)) { renderShare404(); }
+    if (r && r.success && r.authorized) {
+        renderSharedFolderBody({ ownerId: pendingShareResolved.ownerId, ownerName: pendingShareResolved.ownerName, itemType: 'folder', item: r.item, role: r.role }, pendingShareCode, sharedViewerUid, targetPath);
+        resetSharedViewScroll();
+    } else if (r && r.deleted && targetPath !== freshRootPath) {
+        // Bukan root-nya yang hilang, tapi subfolder tempat viewer lagi berada
+        // (dihapus/dipindah pemiliknya) -- mundur ke root, bukan macet di kosong.
+        sharedPathSegments = [];
+        showToast("Folder ini sudah tidak ada lagi, kembali ke folder utama.", true);
+        navigateSharedTo(true);
+    } else {
+        renderShare404();
+    }
 }
 
 // Ambil chunks (Telegram file id) sebuah berkas yang dibagikan langsung dari
@@ -4450,7 +4582,7 @@ async function renderSharedFolderBody(res, shareId, viewerUid, subPath) {
         }, (e) => {
             if (e.target.closest('button') || e.target.closest('input')) return;
             if (sharedIsSelecting) { const chk = card.querySelector('.folder-checkbox'); chk.checked = !chk.checked; toggleSharedFolderSelect(e, sf, chk); }
-            else navigateSharedTo(sf);
+            else enterSharedSubfolder(sf.split('/').pop());
         });
         folderGrid.appendChild(card);
     });
@@ -4689,7 +4821,7 @@ function sharedDeleteFolderFromMenu() {
         hideLoadingOverlay();
         if (res && res.success) {
             showToast("Folder dipindahkan ke sampah.", false);
-            navigateSharedTo(sharedCurrentPath);
+            navigateSharedTo();
         } else { showToast((res && res.message) || "Gagal menghapus folder.", true); }
     });
 }
