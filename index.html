@@ -313,7 +313,7 @@
                 <div class="action-menu-item" onclick="closeSharedFabMenu(); openSharedUploadModal();">
                     <span class="material-symbols-rounded" style="color:var(--primary);">upload_file</span><span>Upload File</span>
                 </div>
-                <div class="action-menu-item" onclick="closeSharedFabMenu(); sharedCreateFolderPrompt();">
+                <div class="action-menu-item" onclick="closeSharedFabMenu(); openSharedCreateFolderModal();">
                     <span class="material-symbols-rounded" style="color:var(--primary);">create_new_folder</span><span>Buat Folder Baru</span>
                 </div>
             </div>
@@ -580,6 +580,20 @@
                 <input type="text" id="new-folder-name" placeholder="Masukkan Nama Folder">
             </div>
             <button class="btn-primary" onclick="createFolder()">Buat Sekarang</button>
+        </div>
+    </div>
+
+    <div class="modal" id="shared-folder-modal">
+        <div class="modal-content" style="max-width: 360px;">
+            <div class="modal-header">
+                <h3>Buat Folder</h3>
+                <button class="icon-btn" onclick="closeSharedCreateFolderModal()"><span class="material-symbols-rounded">close</span></button>
+            </div>
+            <div class="input-group">
+                <label>Nama Folder</label>
+                <input type="text" id="shared-new-folder-name" placeholder="Masukkan Nama Folder" onkeydown="if(event.key==='Enter') executeSharedCreateFolder();">
+            </div>
+            <button class="btn-primary" onclick="executeSharedCreateFolder()">Buat Sekarang</button>
         </div>
     </div>
 
