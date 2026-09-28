@@ -1591,7 +1591,14 @@ function renderFiles(filterText = '', mode = 'home') {
 function scrollToAndHighlightFile(fileId) {
     const el = document.getElementById('filecard-' + fileId);
     if (!el) return;
-    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    // FIX: jangan pakai scrollIntoView -- di HP ia ikut menggeser viewport/dokumen
+    // sehingga header (navbar) terdorong keluar layar. Scroll HANYA kontainer <main>.
+    const mainEl = document.querySelector('main');
+    if (mainEl) {
+        const mr = mainEl.getBoundingClientRect(), er = el.getBoundingClientRect();
+        mainEl.scrollTo({ top: mainEl.scrollTop + (er.top - mr.top) - (mr.height - er.height) / 2, behavior: 'smooth' });
+    }
+    window.scrollTo(0, 0); document.documentElement.scrollTop = 0; document.body.scrollTop = 0;
     el.classList.add('file-card-highlight-flash');
     setTimeout(() => { el.classList.remove('file-card-highlight-flash'); }, 3700);
 }
