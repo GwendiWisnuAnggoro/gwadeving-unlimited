@@ -84,14 +84,17 @@ async function getDirectTelegramUrls(chunksMeta, signal) {
 (function injectHighlightFlashStyle() {
     const css = `
         @keyframes fileCardHighlightFlash {
-            0%   { box-shadow: 0 0 0 0 rgba(59,130,246,0); background-color: transparent; }
-            12%  { box-shadow: 0 0 0 3px rgba(59,130,246,0.55); background-color: rgba(59,130,246,0.14); }
-            50%  { box-shadow: 0 0 0 2px rgba(59,130,246,0.35); background-color: rgba(59,130,246,0.08); }
-            100% { box-shadow: 0 0 0 0 rgba(59,130,246,0); background-color: transparent; }
+            0%   { box-shadow: 0 0 0 0 rgba(5,150,105,0), 0 0 0 0 rgba(16,185,129,0); background-position: 0% 50%; }
+            15%  { box-shadow: 0 0 0 3px rgba(5,150,105,0.55), 0 4px 24px -4px rgba(16,185,129,0.45); background-position: 50% 50%; }
+            50%  { box-shadow: 0 0 0 2px rgba(16,185,129,0.4), 0 4px 20px -6px rgba(5,150,105,0.3); background-position: 100% 50%; }
+            85%  { box-shadow: 0 0 0 3px rgba(5,150,105,0.5), 0 4px 22px -4px rgba(16,185,129,0.4); background-position: 50% 50%; }
+            100% { box-shadow: 0 0 0 0 rgba(5,150,105,0), 0 0 0 0 rgba(16,185,129,0); background-position: 0% 50%; }
         }
         .file-card-highlight-flash {
-            animation: fileCardHighlightFlash 1.8s ease-out 2;
+            animation: fileCardHighlightFlash 1.8s ease-in-out 2;
             border-radius: 12px;
+            background-image: linear-gradient(120deg, rgba(5,150,105,0.16), rgba(16,185,129,0.22), rgba(52,211,153,0.16), rgba(16,185,129,0.22), rgba(5,150,105,0.16));
+            background-size: 300% 100%;
         }
     `;
     const styleTag = document.createElement('style');
@@ -2713,20 +2716,25 @@ function openSharedUploadModal() {
     openUploadModal();
 }
 
-// FIX: viewer/editor dengan akses Edit sekarang juga bisa membuat SUBFOLDER
-// baru di dalam folder yang sedang dibuka lewat tautan berbagi (dulu cuma
-// bisa upload file). Cakupan & peran tetap divalidasi final di server lewat
-// action 'shared_create_folder' (lihat backend.gs) -- folder baru tercatat
-// milik pemilik share, sama seperti file yang diupload lewat share.
-async function sharedCreateFolderPrompt() {
+// FIX: dulu pakai prompt() bawaan browser (tampilannya kasar/tidak konsisten
+// dengan UI app) -- sekarang pakai modal yang sama persis gayanya dengan
+// modal "Buat Folder" di drive sendiri.
+function openSharedCreateFolderModal() {
     if (sharedUploadFabRole !== 'edit') { showToast("Anda tidak memiliki akses Edit di folder ini.", true); return; }
-    const name = prompt("Nama folder baru:");
-    if (name === null) return;
-    const trimmed = name.trim();
+    document.getElementById('shared-new-folder-name').value = '';
+    document.getElementById('shared-folder-modal').style.display = 'flex';
+    setTimeout(() => document.getElementById('shared-new-folder-name').focus(), 50);
+}
+function closeSharedCreateFolderModal() { document.getElementById('shared-folder-modal').style.display = 'none'; }
+
+async function executeSharedCreateFolder() {
+    const input = document.getElementById('shared-new-folder-name');
+    const trimmed = (input.value || '').trim();
     if (!trimmed) return showToast("Nama folder tidak boleh kosong.", true);
     if (trimmed.length > 300) return showToast("Nama terlalu panjang (maksimal 300 karakter).", true);
     if (/[<>\/]/.test(trimmed)) return showToast("Nama tidak boleh mengandung karakter < > /.", true);
     const newPath = sharedCurrentPath ? (sharedCurrentPath + '/' + trimmed) : trimmed;
+    closeSharedCreateFolderModal();
     showLoadingOverlay("Membuat folder...", false, false);
     const res = await callGasAPI('shared_create_folder', { folderPath: newPath, shareId: pendingShareCode, viewerUid: sharedViewerUid });
     hideLoadingOverlay();
@@ -4229,6 +4237,21 @@ function startSharedPolling(code) {
         }
 
         let res = await getSharedDataFromSheets(code, sharedViewerUid, queryPath, forceLive);
+
+        // FIX: cache gviz (Google Sheets published-web query) kadang lebih
+        // lambat mengikuti perubahan (rename/hapus/upload) dibanding baca
+        // langsung ke GAS -- akibatnya folder yang BARU di-rename bisa
+        // sesaat terlihat "Tidak ada berkas di sini" (baris filenya masih
+        // memuat snapshot path LAMA di cache gviz), padahal isinya
+        // sebenarnya ada. Kalau hasil non-forceLive kelihatan KOSONG,
+        // konfirmasi dulu ke sumber live (GAS, tanpa cache) sebelum
+        // dipercaya/dirender -- supaya tidak "kedip kosong lalu balik".
+        const emptyLooking = res && res.success && res.authorized && res.itemType === 'folder' && res.item && res.item.contents &&
+            res.item.contents.subfolders.length === 0 && res.item.contents.files.length === 0;
+        if (!forceLive && emptyLooking) {
+            const liveConfirm = await getSharedDataFromSheets(code, sharedViewerUid, queryPath, true);
+            if (liveConfirm && liveConfirm.success) res = liveConfirm;
+        }
         
         // Kalau gviz (bukan forceLive) kelihatan gagal/dihapus/tidak authorized,
         // JANGAN langsung divonis -- konfirmasi SEKALI SAJA ke sumber live (GAS)
@@ -4291,9 +4314,30 @@ function startSharedPolling(code) {
             }
             hideLoadingOverlay();
             // ------------------------------------------
+
+            // FIX: kalau pengguna SEDANG mengupload lewat halaman share ini
+            // dan pemilik mendadak mengganti privasinya (dicabut/dibatasi),
+            // upload yang sedang berjalan harus langsung terbatal juga --
+            // dulu upload ini pakai jalur XHR/antrean sendiri (bukan
+            // globalAbortController di atas) jadi tetap lanjut walau
+            // akses sudah dicabut.
+            if (sharedUploadActive && isUploadInProgress) {
+                closeUploadModal();
+                showToast("Upload dibatalkan: akses ke folder ini baru saja dicabut/diubah pemiliknya.", true);
+            }
             
             renderSharedAuthWall(res); 
             return; 
+        }
+
+        // FIX: sama seperti di atas, tapi untuk kasus akses masih authorized
+        // namun perannya TURUN dari 'edit' ke 'view' (mis. pemilik mengganti
+        // linkRole atau menurunkan peran orang yang diberi akses manual) --
+        // upload yang sedang berjalan harus ikut terbatal juga, bukan
+        // dibiarkan lanjut sampai selesai.
+        if (sharedUploadActive && isUploadInProgress && res.role !== 'edit') {
+            closeUploadModal();
+            showToast("Upload dibatalkan: akses Edit Anda di folder ini baru saja dicabut pemiliknya.", true);
         }
 
         pendingShareResolved = Object.assign({}, pendingShareResolved, res);
@@ -5023,12 +5067,14 @@ function openSharedFolderMenu(e, folderPath) {
     sharedMenuTargetFolderPath = folderPath;
     document.getElementById('opt-file-title').innerText = folderPath.split('/').pop();
     document.getElementById('opt-file-title').title = folderPath.split('/').pop();
-    // FIX: subfolder di dalam share dengan akses Edit juga boleh dihapus
-    // (dipindahkan ke sampah pemilik beserta isinya), sama seperti file.
+    // FIX: subfolder di dalam share dengan akses Edit juga boleh diganti
+    // nama & dihapus (dipindahkan ke sampah pemilik beserta isinya), sama
+    // seperti file.
     let editItemsHTML = '';
     if (sharedUploadFabRole === 'edit') {
         editItemsHTML = `
         <hr style="border: 0; border-top: 1px solid var(--border-color); margin: 6px 0;">
+        <div class="action-menu-item" onclick="sharedRenameFolderFromMenu()"><span class="material-symbols-rounded">edit</span> Ganti Nama</div>
         <div class="action-menu-item danger" onclick="sharedDeleteFolderFromMenu()"><span class="material-symbols-rounded">delete</span> Buang ke Sampah</div>`;
     }
     // FITUR "SALIN LINK PER-ITEM": cuma muncul kalau folder ini SUDAH punya
@@ -5057,6 +5103,30 @@ function copySharedSubItemLink(shareId) {
         const tmp = document.createElement('textarea'); tmp.value = link; document.body.appendChild(tmp); tmp.select();
         document.execCommand('copy'); document.body.removeChild(tmp); showToast("Link disalin!", false);
     });
+}
+// FIX: subfolder di dalam share dengan akses Edit sekarang juga bisa
+// diganti nama (dulu cuma file yang bisa) -- memanggil action backend
+// 'shared_rename_folder' yang mem-validasi cakupan & mengkaskade path ke
+// semua sub-folder/file/share di dalamnya.
+async function sharedRenameFolderFromMenu() {
+    closeFileOptions();
+    if (!sharedMenuTargetFolderPath) return;
+    const path = sharedMenuTargetFolderPath;
+    const oldName = path.split('/').pop();
+    const newName = prompt("Nama baru untuk folder ini:", oldName);
+    if (newName === null) return;
+    const trimmed = newName.trim();
+    if (!trimmed) return showToast("Nama tidak boleh kosong.", true);
+    if (trimmed.length > 300) return showToast("Nama terlalu panjang (maksimal 300 karakter).", true);
+    if (/[<>\/]/.test(trimmed)) return showToast("Nama tidak boleh mengandung karakter < > /.", true);
+    if (trimmed === oldName) return;
+    showLoadingOverlay("Menyimpan nama baru...", false, false);
+    const res = await callGasAPI('shared_rename_folder', { folderPath: path, newName: trimmed, shareId: pendingShareCode, viewerUid: sharedViewerUid });
+    hideLoadingOverlay();
+    if (res && res.success) {
+        showToast("Nama folder berhasil diubah.", false);
+        navigateSharedTo();
+    } else { showToast((res && res.message) || "Gagal mengubah nama folder.", true); }
 }
 // FIX: hapus (pindahkan ke sampah pemilik) subfolder beserta isinya, di
 // dalam folder share dengan akses Edit.
