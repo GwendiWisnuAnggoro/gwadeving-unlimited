@@ -157,6 +157,13 @@ main { flex: 1; background: linear-gradient(180deg, rgba(209, 250, 229, 0.4) 0%,
 .folder-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin-bottom: 24px; }
 
 .folder-card { background: rgba(255, 255, 255, 0.7); backdrop-filter: blur(8px); border: 1px solid rgba(226, 232, 240, 0.8); padding: 16px; border-radius: var(--radius-md); display: flex; align-items: center; gap: 14px; cursor: pointer; transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1); box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.02); animation: fadeSlideUp 0.4s ease-out forwards; position: relative; user-select: none; min-width: 0; }
+/* FIX: dulu kartu folder/file replay animasi masuk (fadeSlideUp) SETIAP KALI
+   halaman shared di-refresh oleh polling realtime (bukan cuma sekali di
+   awal), jadi kelihatan "naik-turun" tiap ada perubahan data. Kontainer
+   grid diberi class ini SAAT re-render realtime (bukan navigasi manual)
+   supaya animasinya tidak diulang -- lihat sharedIsRealtimeRefresh di
+   Script.js. */
+.folder-grid.no-entrance-anim .folder-card, .file-grid.no-entrance-anim .file-card { animation: none !important; }
 .folder-card:hover { border-color: var(--primary); background: #ffffff; transform: translateY(-4px) scale(1.01); box-shadow: 0 12px 24px -6px rgba(5, 150, 105, 0.12); }
 .folder-card.selected { border-color: var(--primary); background: var(--primary-light); box-shadow: 0 0 0 2px var(--primary-glow); }
 .folder-checkbox { display: none; position: absolute; top: 12px; left: 12px; z-index: 10; width: 20px; height: 20px; cursor: pointer; accent-color: var(--primary); background:#fff; border-radius:4px; }
@@ -525,15 +532,3 @@ img, .preview-media {
 }
 #devtools-warning.show { display: flex; }
 #devtools-warning .material-symbols-rounded { font-size: 48px; color: var(--danger); }
-
-
-/* Refresh data di folder yang sama: matikan animasi naik-turun kartu.
-   Item baru cukup fade-in halus (tanpa translate). */
-@keyframes cardFadeOnly { from { opacity: 0; } to { opacity: 1; } }
-.no-card-anim .file-card, .no-card-anim .folder-card { animation: none; }
-.no-card-anim .file-card.card-new, .no-card-anim .folder-card.card-new { animation: cardFadeOnly 0.25s ease-out; }
-
-
-/* Semua tampilan: setelah render awal, kartu tidak naik-turun lagi. */
-body.cards-settled .file-card, body.cards-settled .folder-card { animation: none; }
-body.cards-settled .file-card.card-new, body.cards-settled .folder-card.card-new { animation: cardFadeOnly 0.25s ease-out; }
