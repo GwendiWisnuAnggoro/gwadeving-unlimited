@@ -525,3 +525,15 @@ img, .preview-media {
 }
 #devtools-warning.show { display: flex; }
 #devtools-warning .material-symbols-rounded { font-size: 48px; color: var(--danger); }
+
+
+/* Refresh data di folder yang sama: matikan animasi naik-turun kartu.
+   Item baru cukup fade-in halus (tanpa translate). */
+@keyframes cardFadeOnly { from { opacity: 0; } to { opacity: 1; } }
+.no-card-anim .file-card, .no-card-anim .folder-card { animation: none; }
+.no-card-anim .file-card.card-new, .no-card-anim .folder-card.card-new { animation: cardFadeOnly 0.25s ease-out; }
+
+
+/* Semua tampilan: setelah render awal, kartu tidak naik-turun lagi. */
+body.cards-settled .file-card, body.cards-settled .folder-card { animation: none; }
+body.cards-settled .file-card.card-new, body.cards-settled .folder-card.card-new { animation: cardFadeOnly 0.25s ease-out; }
