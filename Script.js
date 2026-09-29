@@ -847,23 +847,53 @@ async function callGasAPIFetch(action, payload = {}) {
 // ==========================================
 async function saveMetadataOnce_(gasUrl, action, payload) {
     payload.action = action; payload.apiKey = GAS_API_KEY;
+    // FIX: dulu tanpa batas waktu -- kalau respons GAS hilang/lambat, UI upload
+    // menggantung selamanya walau data SUDAH tersimpan. Sekarang dibatasi 45 dtk
+    // (lebih lama dari antrean lock GAS 30 dtk), lalu dianggap networkError.
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 45000);
     try {
-        const res = await fetch(gasUrl, { method: 'POST', body: new URLSearchParams({ payload: JSON.stringify(payload) }) });
+        const res = await fetch(gasUrl, { method: 'POST', body: new URLSearchParams({ payload: JSON.stringify(payload) }), signal: ctrl.signal });
+        clearTimeout(timer);
         if (!res.ok) return { success: false, message: 'Gagal terhubung ke server.', networkError: true };
-        return await res.json();
+        const json = await res.json();
+        // "Tidak ada data yang dikirim" = request-nya kosong di sisi server, BUKAN
+        // penolakan logika -- perlakukan sebagai kegagalan koneksi (boleh diulang).
+        if (json && json.success === false && /Tidak ada data yang dikirim|Sistem sibuk/i.test(json.message || '')) json.networkError = true;
+        return json;
     } catch (e) {
+        clearTimeout(timer);
         return { success: false, message: 'Koneksi terputus, coba lagi nanti.', networkError: true };
     }
+}
+
+// Cek apakah berkas SUDAH tersimpan di server walau respons simpan-metadata gagal
+// diterima (kasus: data sudah masuk & sudah tampil, tapi balasan GAS hilang/timeout).
+async function verifyMetadataSaved_(action, payload) {
+    try {
+        if (action === 'shared_save_metadata') {
+            const r = await callGasAPIFetch('resolve_share', { shareId: payload.shareId, viewerUid: payload.viewerUid || '', subPath: payload.folder || null });
+            const files = (r && r.success && r.item && r.item.contents && r.item.contents.files) || [];
+            return files.some(f => String(f.id) === String(payload.fileId));
+        }
+    } catch (e) {}
+    return false;
 }
 
 async function saveMetadataViaForm(payload, action = "save_metadata") {
     // FIX #4: retry penuh sampai 3x siklus sebelum dianggap gagal permanen.
     let lastResult = { success: false, message: "Tidak ada endpoint GAS yang terpasang.", networkError: true };
+    let attemptNo = 0;
     for (let round = 0; round < 3; round++) {
         for (let i = 0; i < APP_SCRIPT_URLS.length; i++) {
-            lastResult = await saveMetadataOnce_(APP_SCRIPT_URLS[i], action, { ...payload });
+            // 'retry:true' -> backend cek dulu apakah berkas ini sudah tersimpan (idempoten),
+            // supaya percobaan ulang tidak menggandakan baris / berakhir "gagal" palsu.
+            lastResult = await saveMetadataOnce_(APP_SCRIPT_URLS[i], action, { ...payload, retry: attemptNo > 0 });
+            attemptNo++;
             if (!lastResult.networkError) return lastResult;
             console.warn(`[Gwadeving] Endpoint GAS #${i + 1} gagal/limit saat simpan metadata, coba endpoint berikutnya...`);
+            // Data mungkin SUDAH masuk walau balasannya gagal -- cek sebelum mengulang.
+            if (await verifyMetadataSaved_(action, payload)) return { success: true, verified: true };
         }
         if (round < 2) await sleep(600 * (round + 1));
     }
@@ -1410,6 +1440,27 @@ function renderInBatches_(container, items, buildItemFn, emptyHTML, minInitialCo
         container.__batchObserver = observer;
     }
 }
+
+// ANIMASI KARTU (global, semua tampilan): efek naik (fadeSlideUp) HANYA dipakai
+// pada render pertama setelah halaman dibuka/refresh. Setelah itu (ganti tab,
+// pindah folder, rename, upload, polling, dsb.) kartu tidak naik-turun lagi.
+let _cardsSettledScheduled = false;
+function markCardsSettled_() {
+    if (_cardsSettledScheduled) return;
+    if (!document.querySelector('.file-card, .folder-card')) return; // belum ada kartu -> tunggu render berisi
+    _cardsSettledScheduled = true;
+    setTimeout(() => document.body.classList.add('cards-settled'), 900);
+}
+
+// Pantau kemunculan kartu pertama di tampilan mana pun (beranda, folder, berkas,
+// shared, sampah) supaya efek "naik" hanya jalan sekali di awal.
+(function () {
+    const start = () => {
+        const mo = new MutationObserver(() => { markCardsSettled_(); if (_cardsSettledScheduled) mo.disconnect(); });
+        mo.observe(document.body, { childList: true, subtree: true });
+    };
+    if (document.body) start(); else document.addEventListener('DOMContentLoaded', start);
+})();
 
 function renderUI() {
     const titleEl = document.getElementById('view-title');
@@ -3254,6 +3305,7 @@ async function startMultiUpload() {
             await syncData();
         }
         isUploadInProgress = false;
+        if (sharedUploadActive) sharedDataSignature = null; // polling (yang tadi dijeda) langsung sinkron ulang
         if (failCount > 0) {
             // Ada file gagal/dibatalkan -- modal TETAP terbuka supaya pengguna
             // bisa menekan tombol "Ulangi" per file (lihat retryQueueItem),
@@ -3275,7 +3327,7 @@ async function processQueueItem(item, currentIdx, totalFiles) {
     const fileInput = item.file;
     const customName = item.customName.trim() || fileInput.name.split('.')[0];
     const format = item.ext.toLowerCase();
-    const folderTarget = sharedUploadActive ? sharedCurrentPath : ((currentTab === 'home') ? currentPath : '');
+    let folderTarget = sharedUploadActive ? sharedCurrentPath : ((currentTab === 'home') ? currentPath : '');
     const uniqueId = 'FILE_' + Date.now() + '_' + item.qid;
     const prefix = totalFiles > 1 ? `[${currentIdx}/${totalFiles}] ` : '';
     let itemCancelled = false; // FIX: dulu 1 chunk gagal total (semua worker dicoba & tetap gagal)
@@ -3477,10 +3529,21 @@ async function processQueueItem(item, currentIdx, totalFiles) {
     setStatusText(`${prefix}Menyimpan metadata...`);
     let metaRes;
     if (sharedUploadActive) {
-        metaRes = await saveMetadataViaForm({ fileId: uniqueId, customName: customName, originalName: fileInput.name, format: format, folder: folderTarget, fileSize: fileInput.size, totalChunks: totalChunks, chunks: uploadedChunks, thumbId: thumbTelegramId, shareId: sharedUploadShareId, viewerUid: sharedUploadViewerUid }, 'shared_save_metadata');
+        // FIX: polling share dijeda selama upload, jadi kalau pemilik mengganti nama
+        // folder di tengah upload, sharedCurrentPath jadi BASI (berkas tersimpan ke path
+        // lama -> tidak terdeteksi & "Tidak ada berkas di sini"). Resolusi ulang path
+        // terkini langsung dari server tepat sebelum metadata disimpan.
+        const freshPath = await resolveFreshSharedPath_(sharedUploadShareId);
+        if (freshPath !== null) folderTarget = freshPath;
+
+        metaRes = await saveMetadataWithWatch_(
+            () => saveMetadataViaForm({ fileId: uniqueId, customName: customName, originalName: fileInput.name, format: format, folder: folderTarget, fileSize: fileInput.size, totalChunks: totalChunks, chunks: uploadedChunks, thumbId: thumbTelegramId, shareId: sharedUploadShareId, viewerUid: sharedUploadViewerUid }, 'shared_save_metadata'),
+            uniqueId, (pendingShareResolved && pendingShareResolved.ownerId) || '', item);
         if (metaRes && metaRes.success !== false && !sharedContentsCache.files.some(f => f.id === uniqueId)) sharedContentsCache.files.push({ id: uniqueId, name: customName, originalName: fileInput.name, format: format, folder: folderTarget, size: fileInput.size, thumbId: thumbTelegramId });
     } else {
-        metaRes = await saveMetadataViaForm({ fileId: uniqueId, customName: customName, originalName: fileInput.name, format: format, folder: folderTarget, fileSize: fileInput.size, totalChunks: totalChunks, chunks: uploadedChunks, thumbId: thumbTelegramId, ownerId: currentOwnerId });
+        metaRes = await saveMetadataWithWatch_(
+            () => saveMetadataViaForm({ fileId: uniqueId, customName: customName, originalName: fileInput.name, format: format, folder: folderTarget, fileSize: fileInput.size, totalChunks: totalChunks, chunks: uploadedChunks, thumbId: thumbTelegramId, ownerId: currentOwnerId }),
+            uniqueId, currentOwnerId, item);
         if (metaRes && metaRes.success !== false && !stateArray.active.some(f => f.id === uniqueId)) stateArray.active.push({ id: uniqueId, name: customName, originalName: fileInput.name, format: format, folder: folderTarget, size: fileInput.size, thumbId: thumbTelegramId });
     }
 
@@ -3493,6 +3556,56 @@ async function processQueueItem(item, currentIdx, totalFiles) {
 
     item.progressPercent = 100;
     return true;
+}
+
+// Apakah berkas (by id) sudah tercatat di spreadsheet? Baca via gviz (tanpa
+// antre lock GAS), jadi tetap bisa dicek walau GAS masih sibuk/lambat membalas.
+async function fileVisibleOnServer_(fileId, ownerId) {
+    try {
+        const raw = await fetchRawSheets();
+        return raw.sheet1Rows.some(r => String(r[0]) === String(fileId) && (!ownerId || String(r[8]) === String(ownerId)));
+    } catch (e) { return false; }
+}
+
+// Simpan metadata SAMBIL memantau: begitu 100% chunk sudah terkirim dan berkas
+// terbukti sudah ada di server (UI sudah bertambah), upload langsung dianggap
+// SELESAI setelah jeda 1 detik -- tanpa menunggu balasan GAS yang kadang
+// lambat/hilang (sumber "timeout" palsu padahal data sudah tersimpan).
+async function saveMetadataWithWatch_(saveFn, fileId, ownerId, item) {
+    let finished = false;
+    const savePromise = saveFn().then(r => { finished = true; return r; });
+    const watcher = (async () => {
+        await sleep(1500);
+        for (let i = 0; i < 60 && !finished; i++) {
+            if (item && item.cancelRequested) return null;
+            if (await fileVisibleOnServer_(fileId, ownerId)) {
+                if (finished) return null;
+                await sleep(1000); // jeda 1 detik sebelum ditandai selesai
+                return { success: true, verified: true };
+            }
+            await sleep(1000);
+        }
+        return null;
+    })();
+    const first = await Promise.race([savePromise, watcher.then(w => w || new Promise(() => {}))]);
+    if (first && first.success !== false) return first;
+    // Simpan gagal -- sebelum divonis gagal, cek terakhir apakah datanya ternyata sudah masuk.
+    if (await fileVisibleOnServer_(fileId, ownerId)) return { success: true, verified: true };
+    return first;
+}
+
+// Path folder shared yang paling baru (root diresolusi ulang live + nama relatif
+// sharedPathSegments, dengan fallback ke leluhur terdekat yang masih ada).
+async function resolveFreshSharedPath_(code) {
+    try {
+        const fb = await tryResolveWithAncestorFallback(code, sharedViewerUid, sharedPathSegments);
+        if (fb && fb.path) {
+            if (fb.segments.length !== sharedPathSegments.length) sharedPathSegments = fb.segments;
+            sharedCurrentPath = fb.path;
+            return fb.path;
+        }
+    } catch (e) {}
+    return null;
 }
 
 function openCreateFolderModal() { document.getElementById('folder-modal').style.display = 'flex'; }
@@ -3954,6 +4067,7 @@ async function handleSharedLink(code) {
     sharedRootItem = { path: res.item.path || '', name: res.item.name, itemType: res.itemType, ownerId: res.ownerId };
     sharedCurrentPath = res.item.path || '';
     sharedPathSegments = []; // baru masuk lagi dari root
+    sharedLastRenderKey = null;
     updateSharedViewChrome();
 
     document.getElementById('shared-owner-banner').style.display = 'flex';
@@ -4249,6 +4363,12 @@ function startSharedPolling(code) {
         const emptyLooking = res && res.success && res.authorized && res.itemType === 'folder' && res.item && res.item.contents &&
             res.item.contents.subfolders.length === 0 && res.item.contents.files.length === 0;
         if (!forceLive && emptyLooking) {
+            // FIX "Tidak ada berkas di sini" palsu: queryPath bisa basi (pemilik rename
+            // folder, UI belum ikut). Resolusi ulang root live dulu, baru konfirmasi.
+            const freshRoot = await getSharedDataFromSheets(code, sharedViewerUid, null, true);
+            if (freshRoot && freshRoot.success && freshRoot.authorized && freshRoot.item) {
+                queryPath = sharedPathSegments.length ? (freshRoot.item.path + '/' + sharedPathSegments.join('/')) : freshRoot.item.path;
+            }
             const liveConfirm = await getSharedDataFromSheets(code, sharedViewerUid, queryPath, true);
             if (liveConfirm && liveConfirm.success) res = liveConfirm;
         }
@@ -4798,6 +4918,8 @@ async function collectSharedFolderFilesRecursive(folderPath, relPrefix, rawData 
     return results;
 }
 
+let sharedLastRenderKey = null;
+let sharedLastRenderedKeys = new Set();
 async function renderSharedFolderBody(res, shareId, viewerUid, subPath) {
     sharedCurrentPath = subPath || '';
     sharedCurrentFolderName = res.item.name;
@@ -4811,6 +4933,16 @@ async function renderSharedFolderBody(res, shareId, viewerUid, subPath) {
     renderSharedBreadcrumb(Object.assign({ ownerId: pendingShareResolved ? pendingShareResolved.ownerId : res.ownerId, ownerName: pendingShareResolved ? pendingShareResolved.ownerName : res.ownerName }, res), subPath);
 
     const body = document.getElementById('shared-body');
+    // ANIMASI: kartu hanya "naik" (fadeSlideUp) saat pertama masuk / pindah folder.
+    // Saat data cuma ter-refresh (polling/upload/rename) di folder yang sama, animasi
+    // dimatikan supaya tidak naik-turun; item BARU cukup fade-in halus.
+    const renderKey = String(shareId) + '|' + sharedPathSegments.join('/');
+    const isRefresh = (sharedLastRenderKey === renderKey) && !!body.querySelector('#shared-file-grid');
+    sharedLastRenderKey = renderKey;
+    const prevKeys = isRefresh ? sharedLastRenderedKeys : null;
+    const nextKeys = new Set();
+    const scroller = document.getElementById('shared-view');
+    const prevScroll = isRefresh && scroller ? scroller.scrollTop : 0;
     body.innerHTML = `
         <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; gap:12px; flex-wrap:wrap;">
             <h2 style="font-size:20px; font-weight:800;">${res.item.name}</h2>
@@ -4849,6 +4981,8 @@ async function renderSharedFolderBody(res, shareId, viewerUid, subPath) {
             if (sharedIsSelecting) { const chk = card.querySelector('.folder-checkbox'); chk.checked = !chk.checked; toggleSharedFolderSelect(e, sf, chk); }
             else enterSharedSubfolder(sf.split('/').pop());
         });
+        nextKeys.add('d:' + sf);
+        if (prevKeys && !prevKeys.has('d:' + sf)) card.classList.add('card-new');
         folderGrid.appendChild(card);
     });
 
@@ -4874,9 +5008,14 @@ async function renderSharedFolderBody(res, shareId, viewerUid, subPath) {
             if (sharedIsSelecting) { const chk = card.querySelector('.file-checkbox'); chk.checked = !chk.checked; toggleSharedSelect(e, f.id, chk); }
             else openSharedFilePreviewModal(f, shareId, viewerUid);
         });
+        nextKeys.add('f:' + f.id);
+        if (prevKeys && !prevKeys.has('f:' + f.id)) card.classList.add('card-new');
         fileGrid.appendChild(card);
         if (IMAGE_EXTENSIONS.has(ext) || VIDEO_EXTENSIONS.has(ext)) loadSharedCardThumbnail(f, ext, `shared-thumb-${f.id}`, shareId, viewerUid);
     });
+    sharedLastRenderedKeys = nextKeys;
+    markCardsSettled_();
+    if (isRefresh && scroller) scroller.scrollTop = prevScroll;
     updateSharedSelectionToolbar();
 }
 
@@ -6032,7 +6171,7 @@ function exitSharedView() {
     document.getElementById('share-login-prompt').style.display = 'none';
     sharedLoginPromptDismissed = false;
     const ownerIdToRestore = preShareOwnerId;
-    pendingShareCode = null; pendingShareResolved = null; sharedRootItem = null; sharedCurrentPath = '';
+    pendingShareCode = null; pendingShareResolved = null; sharedRootItem = null; sharedCurrentPath = ''; sharedLastRenderKey = null;
     sharedViewerUid = ''; preShareOwnerId = ''; preShareUser = '';
     window.history.replaceState({}, document.title, location.origin + location.pathname);
 
