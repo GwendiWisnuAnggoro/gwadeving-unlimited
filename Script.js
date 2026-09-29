@@ -6557,4 +6557,3 @@ if ('serviceWorker' in navigator) {
     }
     setInterval(checkDevtools, 1000);
 })();
-
