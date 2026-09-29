@@ -285,6 +285,15 @@ let sharedIsOwnerView = false;
 let sharedFileShareRole = 'view';
 let sharedRootItem = null;
 let sharedCurrentPath = '';
+// FIX: dipakai renderSharedFolderBody() untuk tahu apakah pemanggilan ini
+// adalah re-render REALTIME (dari tick polling, saat data berubah) atau
+// navigasi manual/pembukaan awal -- supaya animasi masuk kartu cuma
+// diputar sekali di awal, bukan tiap kali data di-refresh.
+let sharedIsRealtimeRefresh = false;
+let sharedHasRenderedOnce = false;
+// Sama seperti sharedIsRealtimeRefresh di atas, tapi untuk halaman drive
+// milik sendiri (lihat renderUI() & realtimePollTick).
+let isOwnRealtimeRefresh = false;
 // FIX BUG "STUCK SAAT RENAME/PRIVASI DIUBAH SAAT SEDANG DIBUKA": posisi
 // browsing di dalam folder share disimpan sebagai SEGMEN NAMA relatif dari
 // root (bukan path absolut). Path absolut basi kalau root/leluhurnya
@@ -845,55 +854,47 @@ async function callGasAPIFetch(action, payload = {}) {
 // e.parameter.payload) supaya respons aslinya bisa dibaca, dan endpoint bisa
 // di-fallback kalau salah satu limit/gagal -- sama seperti callGasAPI.
 // ==========================================
-async function saveMetadataOnce_(gasUrl, action, payload) {
+// FIX BUG NYATA: sebelumnya pakai fetch() untuk POST ke GAS. Google Apps
+// Script Web App SELALU membalas permintaan awal dengan redirect 302 ke URL
+// eksekusi sebenarnya (script.googleusercontent.com) -- dan sesuai spesifikasi
+// fetch(), redirect 301/302 pada method POST diubah paksa jadi GET TANPA BODY
+// oleh browser. Akibatnya sesekali (tergantung timing/cache Google) request
+// yang sampai ke server itu GET kosong -> e.parameter.data & e.parameter.payload
+// dua-duanya kosong -> "Tidak ada data yang dikirim", PADAHAL upload
+// chunk-nya sendiri sudah sukses duluan (makanya UI kadang sempat menampilkan
+// filenya lewat polling gviz walau pesan error ini muncul). XMLHttpRequest
+// (dipakai di sini) mempertahankan method POST & body-nya lewat redirect,
+// jadi tidak kena masalah ini.
+function saveMetadataOnce_(gasUrl, action, payload) {
     payload.action = action; payload.apiKey = GAS_API_KEY;
-    // FIX: dulu tanpa batas waktu -- kalau respons GAS hilang/lambat, UI upload
-    // menggantung selamanya walau data SUDAH tersimpan. Sekarang dibatasi 45 dtk
-    // (lebih lama dari antrean lock GAS 30 dtk), lalu dianggap networkError.
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 45000);
-    try {
-        const res = await fetch(gasUrl, { method: 'POST', body: new URLSearchParams({ payload: JSON.stringify(payload) }), signal: ctrl.signal });
-        clearTimeout(timer);
-        if (!res.ok) return { success: false, message: 'Gagal terhubung ke server.', networkError: true };
-        const json = await res.json();
-        // "Tidak ada data yang dikirim" = request-nya kosong di sisi server, BUKAN
-        // penolakan logika -- perlakukan sebagai kegagalan koneksi (boleh diulang).
-        if (json && json.success === false && /Tidak ada data yang dikirim|Sistem sibuk/i.test(json.message || '')) json.networkError = true;
-        return json;
-    } catch (e) {
-        clearTimeout(timer);
-        return { success: false, message: 'Koneksi terputus, coba lagi nanti.', networkError: true };
-    }
-}
-
-// Cek apakah berkas SUDAH tersimpan di server walau respons simpan-metadata gagal
-// diterima (kasus: data sudah masuk & sudah tampil, tapi balasan GAS hilang/timeout).
-async function verifyMetadataSaved_(action, payload) {
-    try {
-        if (action === 'shared_save_metadata') {
-            const r = await callGasAPIFetch('resolve_share', { shareId: payload.shareId, viewerUid: payload.viewerUid || '', subPath: payload.folder || null });
-            const files = (r && r.success && r.item && r.item.contents && r.item.contents.files) || [];
-            return files.some(f => String(f.id) === String(payload.fileId));
+    return new Promise((resolve) => {
+        try {
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', gasUrl, true);
+            xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+            xhr.timeout = 30000;
+            xhr.onload = () => {
+                if (xhr.status < 200 || xhr.status >= 300) { resolve({ success: false, message: 'Gagal terhubung ke server.', networkError: true }); return; }
+                try { resolve(JSON.parse(xhr.responseText)); }
+                catch (e) { resolve({ success: false, message: 'Respons server tidak valid.', networkError: true }); }
+            };
+            xhr.onerror = () => resolve({ success: false, message: 'Koneksi terputus, coba lagi nanti.', networkError: true });
+            xhr.ontimeout = () => resolve({ success: false, message: 'Koneksi terputus, coba lagi nanti.', networkError: true });
+            xhr.send('payload=' + encodeURIComponent(JSON.stringify(payload)));
+        } catch (e) {
+            resolve({ success: false, message: 'Koneksi terputus, coba lagi nanti.', networkError: true });
         }
-    } catch (e) {}
-    return false;
+    });
 }
 
 async function saveMetadataViaForm(payload, action = "save_metadata") {
     // FIX #4: retry penuh sampai 3x siklus sebelum dianggap gagal permanen.
     let lastResult = { success: false, message: "Tidak ada endpoint GAS yang terpasang.", networkError: true };
-    let attemptNo = 0;
     for (let round = 0; round < 3; round++) {
         for (let i = 0; i < APP_SCRIPT_URLS.length; i++) {
-            // 'retry:true' -> backend cek dulu apakah berkas ini sudah tersimpan (idempoten),
-            // supaya percobaan ulang tidak menggandakan baris / berakhir "gagal" palsu.
-            lastResult = await saveMetadataOnce_(APP_SCRIPT_URLS[i], action, { ...payload, retry: attemptNo > 0 });
-            attemptNo++;
+            lastResult = await saveMetadataOnce_(APP_SCRIPT_URLS[i], action, { ...payload });
             if (!lastResult.networkError) return lastResult;
             console.warn(`[Gwadeving] Endpoint GAS #${i + 1} gagal/limit saat simpan metadata, coba endpoint berikutnya...`);
-            // Data mungkin SUDAH masuk walau balasannya gagal -- cek sebelum mengulang.
-            if (await verifyMetadataSaved_(action, payload)) return { success: true, verified: true };
         }
         if (round < 2) await sleep(600 * (round + 1));
     }
@@ -1208,7 +1209,9 @@ async function realtimePollTick() {
         const data = buildStateArrayFromRaw(raw, currentOwnerId);
         const sig = JSON.stringify(data);
         if (sig !== lastDataSignature) {
-            lastDataSignature = sig; stateArray = data; renderUI();
+            lastDataSignature = sig; stateArray = data;
+            isOwnRealtimeRefresh = true;
+            renderUI();
             // FIX REALTIME: kalau ada modal preview yang lagi terbuka pas
             // perubahan ini masuk (mis. nama/ukuran file yang sedang dilihat
             // diubah dari perangkat lain), judul & info di modalnya sendiri
@@ -1441,32 +1444,24 @@ function renderInBatches_(container, items, buildItemFn, emptyHTML, minInitialCo
     }
 }
 
-// ANIMASI KARTU (global, semua tampilan): efek naik (fadeSlideUp) HANYA dipakai
-// pada render pertama setelah halaman dibuka/refresh. Setelah itu (ganti tab,
-// pindah folder, rename, upload, polling, dsb.) kartu tidak naik-turun lagi.
-let _cardsSettledScheduled = false;
-function markCardsSettled_() {
-    if (_cardsSettledScheduled) return;
-    if (!document.querySelector('.file-card, .folder-card')) return; // belum ada kartu -> tunggu render berisi
-    _cardsSettledScheduled = true;
-    setTimeout(() => document.body.classList.add('cards-settled'), 900);
-}
-
-// Pantau kemunculan kartu pertama di tampilan mana pun (beranda, folder, berkas,
-// shared, sampah) supaya efek "naik" hanya jalan sekali di awal.
-(function () {
-    const start = () => {
-        const mo = new MutationObserver(() => { markCardsSettled_(); if (_cardsSettledScheduled) mo.disconnect(); });
-        mo.observe(document.body, { childList: true, subtree: true });
-    };
-    if (document.body) start(); else document.addEventListener('DOMContentLoaded', start);
-})();
-
 function renderUI() {
     const titleEl = document.getElementById('view-title');
     const breadcrumbEl = document.getElementById('breadcrumb-nav');
     const searchInput = document.getElementById('search-input');
     const q = searchInput ? searchInput.value : '';
+
+    // FIX: sama seperti di halaman shared -- dulu kartu folder/file replay
+    // animasi masuk SETIAP KALI ada refresh realtime (bukan cuma sekali di
+    // awal), jadi kelihatan "naik-turun" tiap ada perubahan data (mis. dari
+    // perangkat lain). Flag ini HANYA diset true oleh tick polling tepat
+    // sebelum memanggil renderUI() (lihat realtimePollTick), lalu langsung
+    // direset di sini supaya panggilan LAIN ke renderUI() (aksi pengguna
+    // sendiri: upload, buat folder, dsb.) tetap dapat animasi seperti biasa.
+    const ownFolderList = document.getElementById('folder-list');
+    const ownFileList = document.getElementById('file-list');
+    if (isOwnRealtimeRefresh) { if (ownFolderList) ownFolderList.classList.add('no-entrance-anim'); if (ownFileList) ownFileList.classList.add('no-entrance-anim'); }
+    else { if (ownFolderList) ownFolderList.classList.remove('no-entrance-anim'); if (ownFileList) ownFileList.classList.remove('no-entrance-anim'); }
+    isOwnRealtimeRefresh = false;
 
     if (currentTab === 'trash') {
         titleEl.innerText = "Sampah"; breadcrumbEl.innerHTML = "";
@@ -3305,7 +3300,6 @@ async function startMultiUpload() {
             await syncData();
         }
         isUploadInProgress = false;
-        if (sharedUploadActive) sharedDataSignature = null; // polling (yang tadi dijeda) langsung sinkron ulang
         if (failCount > 0) {
             // Ada file gagal/dibatalkan -- modal TETAP terbuka supaya pengguna
             // bisa menekan tombol "Ulangi" per file (lihat retryQueueItem),
@@ -3327,7 +3321,7 @@ async function processQueueItem(item, currentIdx, totalFiles) {
     const fileInput = item.file;
     const customName = item.customName.trim() || fileInput.name.split('.')[0];
     const format = item.ext.toLowerCase();
-    let folderTarget = sharedUploadActive ? sharedCurrentPath : ((currentTab === 'home') ? currentPath : '');
+    const folderTarget = sharedUploadActive ? sharedCurrentPath : ((currentTab === 'home') ? currentPath : '');
     const uniqueId = 'FILE_' + Date.now() + '_' + item.qid;
     const prefix = totalFiles > 1 ? `[${currentIdx}/${totalFiles}] ` : '';
     let itemCancelled = false; // FIX: dulu 1 chunk gagal total (semua worker dicoba & tetap gagal)
@@ -3529,25 +3523,28 @@ async function processQueueItem(item, currentIdx, totalFiles) {
     setStatusText(`${prefix}Menyimpan metadata...`);
     let metaRes;
     if (sharedUploadActive) {
-        // FIX: polling share dijeda selama upload, jadi kalau pemilik mengganti nama
-        // folder di tengah upload, sharedCurrentPath jadi BASI (berkas tersimpan ke path
-        // lama -> tidak terdeteksi & "Tidak ada berkas di sini"). Resolusi ulang path
-        // terkini langsung dari server tepat sebelum metadata disimpan.
-        const freshPath = await resolveFreshSharedPath_(sharedUploadShareId);
-        if (freshPath !== null) folderTarget = freshPath;
-
-        metaRes = await saveMetadataWithWatch_(
-            () => saveMetadataViaForm({ fileId: uniqueId, customName: customName, originalName: fileInput.name, format: format, folder: folderTarget, fileSize: fileInput.size, totalChunks: totalChunks, chunks: uploadedChunks, thumbId: thumbTelegramId, shareId: sharedUploadShareId, viewerUid: sharedUploadViewerUid }, 'shared_save_metadata'),
-            uniqueId, (pendingShareResolved && pendingShareResolved.ownerId) || '', item);
+        metaRes = await saveMetadataViaForm({ fileId: uniqueId, customName: customName, originalName: fileInput.name, format: format, folder: folderTarget, fileSize: fileInput.size, totalChunks: totalChunks, chunks: uploadedChunks, thumbId: thumbTelegramId, shareId: sharedUploadShareId, viewerUid: sharedUploadViewerUid }, 'shared_save_metadata');
         if (metaRes && metaRes.success !== false && !sharedContentsCache.files.some(f => f.id === uniqueId)) sharedContentsCache.files.push({ id: uniqueId, name: customName, originalName: fileInput.name, format: format, folder: folderTarget, size: fileInput.size, thumbId: thumbTelegramId });
     } else {
-        metaRes = await saveMetadataWithWatch_(
-            () => saveMetadataViaForm({ fileId: uniqueId, customName: customName, originalName: fileInput.name, format: format, folder: folderTarget, fileSize: fileInput.size, totalChunks: totalChunks, chunks: uploadedChunks, thumbId: thumbTelegramId, ownerId: currentOwnerId }),
-            uniqueId, currentOwnerId, item);
+        metaRes = await saveMetadataViaForm({ fileId: uniqueId, customName: customName, originalName: fileInput.name, format: format, folder: folderTarget, fileSize: fileInput.size, totalChunks: totalChunks, chunks: uploadedChunks, thumbId: thumbTelegramId, ownerId: currentOwnerId });
         if (metaRes && metaRes.success !== false && !stateArray.active.some(f => f.id === uniqueId)) stateArray.active.push({ id: uniqueId, name: customName, originalName: fileInput.name, format: format, folder: folderTarget, size: fileInput.size, thumbId: thumbTelegramId });
     }
 
     if (!metaRes || metaRes.success === false) {
+        // FIX: sebelum benar-benar divonis gagal, cek dulu ke server apakah
+        // baris metadata ini SEBENARNYA sudah tersimpan (bisa terjadi kalau
+        // permintaan sempat sukses di server tapi RESPONSNYA yang gagal
+        // sampai balik ke browser -- pesan errornya jadi menyesatkan padahal
+        // datanya sudah ada). Kalau ternyata sudah ada, anggap sukses saja.
+        const verifyRes = sharedUploadActive
+            ? await callGasAPI('get_chunks', { fileId: uniqueId, shareId: sharedUploadShareId, viewerUid: sharedUploadViewerUid })
+            : await callGasAPI('get_chunks', { fileId: uniqueId, ownerId: currentOwnerId });
+        if (verifyRes && verifyRes.success) {
+            if (sharedUploadActive) { if (!sharedContentsCache.files.some(f => f.id === uniqueId)) sharedContentsCache.files.push({ id: uniqueId, name: customName, originalName: fileInput.name, format: format, folder: folderTarget, size: fileInput.size, thumbId: thumbTelegramId }); }
+            else { if (!stateArray.active.some(f => f.id === uniqueId)) stateArray.active.push({ id: uniqueId, name: customName, originalName: fileInput.name, format: format, folder: folderTarget, size: fileInput.size, thumbId: thumbTelegramId }); }
+            item.progressPercent = 100;
+            return true;
+        }
         item.statusText = `Metadata gagal disimpan: ${(metaRes && metaRes.message) || 'semua server penuh/limit'}`;
         setStatusText(item.statusText);
         showToast(`Gagal menyimpan metadata untuk ${customName}: ${(metaRes && metaRes.message) || 'semua server penuh/limit'}.`, true);
@@ -3556,56 +3553,6 @@ async function processQueueItem(item, currentIdx, totalFiles) {
 
     item.progressPercent = 100;
     return true;
-}
-
-// Apakah berkas (by id) sudah tercatat di spreadsheet? Baca via gviz (tanpa
-// antre lock GAS), jadi tetap bisa dicek walau GAS masih sibuk/lambat membalas.
-async function fileVisibleOnServer_(fileId, ownerId) {
-    try {
-        const raw = await fetchRawSheets();
-        return raw.sheet1Rows.some(r => String(r[0]) === String(fileId) && (!ownerId || String(r[8]) === String(ownerId)));
-    } catch (e) { return false; }
-}
-
-// Simpan metadata SAMBIL memantau: begitu 100% chunk sudah terkirim dan berkas
-// terbukti sudah ada di server (UI sudah bertambah), upload langsung dianggap
-// SELESAI setelah jeda 1 detik -- tanpa menunggu balasan GAS yang kadang
-// lambat/hilang (sumber "timeout" palsu padahal data sudah tersimpan).
-async function saveMetadataWithWatch_(saveFn, fileId, ownerId, item) {
-    let finished = false;
-    const savePromise = saveFn().then(r => { finished = true; return r; });
-    const watcher = (async () => {
-        await sleep(1500);
-        for (let i = 0; i < 60 && !finished; i++) {
-            if (item && item.cancelRequested) return null;
-            if (await fileVisibleOnServer_(fileId, ownerId)) {
-                if (finished) return null;
-                await sleep(1000); // jeda 1 detik sebelum ditandai selesai
-                return { success: true, verified: true };
-            }
-            await sleep(1000);
-        }
-        return null;
-    })();
-    const first = await Promise.race([savePromise, watcher.then(w => w || new Promise(() => {}))]);
-    if (first && first.success !== false) return first;
-    // Simpan gagal -- sebelum divonis gagal, cek terakhir apakah datanya ternyata sudah masuk.
-    if (await fileVisibleOnServer_(fileId, ownerId)) return { success: true, verified: true };
-    return first;
-}
-
-// Path folder shared yang paling baru (root diresolusi ulang live + nama relatif
-// sharedPathSegments, dengan fallback ke leluhur terdekat yang masih ada).
-async function resolveFreshSharedPath_(code) {
-    try {
-        const fb = await tryResolveWithAncestorFallback(code, sharedViewerUid, sharedPathSegments);
-        if (fb && fb.path) {
-            if (fb.segments.length !== sharedPathSegments.length) sharedPathSegments = fb.segments;
-            sharedCurrentPath = fb.path;
-            return fb.path;
-        }
-    } catch (e) {}
-    return null;
 }
 
 function openCreateFolderModal() { document.getElementById('folder-modal').style.display = 'flex'; }
@@ -4067,7 +4014,6 @@ async function handleSharedLink(code) {
     sharedRootItem = { path: res.item.path || '', name: res.item.name, itemType: res.itemType, ownerId: res.ownerId };
     sharedCurrentPath = res.item.path || '';
     sharedPathSegments = []; // baru masuk lagi dari root
-    sharedLastRenderKey = null;
     updateSharedViewChrome();
 
     document.getElementById('shared-owner-banner').style.display = 'flex';
@@ -4308,6 +4254,7 @@ async function tryResolveWithAncestorFallback(code, viewerUid, segments) {
 function startSharedPolling(code) {
     stopSharedPolling();
     sharedDataSignature = null;
+    sharedHasRenderedOnce = false;
     let tickCount = 0;
     
     sharedPollTimer = setInterval(async () => {
@@ -4358,19 +4305,21 @@ function startSharedPolling(code) {
         // sesaat terlihat "Tidak ada berkas di sini" (baris filenya masih
         // memuat snapshot path LAMA di cache gviz), padahal isinya
         // sebenarnya ada. Kalau hasil non-forceLive kelihatan KOSONG,
-        // konfirmasi dulu ke sumber live (GAS, tanpa cache) sebelum
-        // dipercaya/dirender -- supaya tidak "kedip kosong lalu balik".
+        // JANGAN langsung percaya path yang dipakai barusan (queryPath) --
+        // itu juga bisa saja path LAMA yang belum sempat ter-update kalau
+        // root/folder perantaranya baru saja di-rename. Hitung ulang dulu
+        // path yang BENAR-benar terkini dari root (sama seperti tick
+        // forceLive), baru konfirmasi ke sumber live (GAS, tanpa cache)
+        // pakai path segar itu -- supaya tidak "kedip kosong lalu balik".
         const emptyLooking = res && res.success && res.authorized && res.itemType === 'folder' && res.item && res.item.contents &&
             res.item.contents.subfolders.length === 0 && res.item.contents.files.length === 0;
         if (!forceLive && emptyLooking) {
-            // FIX "Tidak ada berkas di sini" palsu: queryPath bisa basi (pemilik rename
-            // folder, UI belum ikut). Resolusi ulang root live dulu, baru konfirmasi.
-            const freshRoot = await getSharedDataFromSheets(code, sharedViewerUid, null, true);
-            if (freshRoot && freshRoot.success && freshRoot.authorized && freshRoot.item) {
-                queryPath = sharedPathSegments.length ? (freshRoot.item.path + '/' + sharedPathSegments.join('/')) : freshRoot.item.path;
-            }
-            const liveConfirm = await getSharedDataFromSheets(code, sharedViewerUid, queryPath, true);
-            if (liveConfirm && liveConfirm.success) res = liveConfirm;
+            const freshRootRes = await getSharedDataFromSheets(code, sharedViewerUid, null, true);
+            const freshPath = (freshRootRes && freshRootRes.success && freshRootRes.authorized && freshRootRes.item)
+                ? (sharedPathSegments.length ? (freshRootRes.item.path + '/' + sharedPathSegments.join('/')) : freshRootRes.item.path)
+                : queryPath;
+            const liveConfirm = await getSharedDataFromSheets(code, sharedViewerUid, freshPath, true);
+            if (liveConfirm && liveConfirm.success) { res = liveConfirm; queryPath = freshPath; }
         }
         
         // Kalau gviz (bukan forceLive) kelihatan gagal/dihapus/tidak authorized,
@@ -4471,10 +4420,8 @@ function startSharedPolling(code) {
         if (sharedDataSignature !== currentSig) {
             sharedDataSignature = currentSig;
             if (!sharedIsSelecting && res.itemType === 'folder') {
-                // Pakai queryPath (path yang BENAR-BENAR baru dipakai untuk ambil
-                // data ini), bukan sharedCurrentPath lama -- supaya begitu root
-                // ter-rename, sharedCurrentPath ikut ter-refresh benar mulai
-                // dari sini (dipakai lagi sebagai basis tick-tick berikutnya).
+                sharedIsRealtimeRefresh = sharedHasRenderedOnce;
+                sharedHasRenderedOnce = true;
                 await renderSharedFolderBody(res, code, sharedViewerUid, queryPath);
                 // FIX REALTIME: kalau ada modal preview file yang lagi
                 // terbuka sambil browsing folder share ini, judulnya dulu
@@ -4918,9 +4865,13 @@ async function collectSharedFolderFilesRecursive(folderPath, relPrefix, rawData 
     return results;
 }
 
-let sharedLastRenderKey = null;
-let sharedLastRenderedKeys = new Set();
 async function renderSharedFolderBody(res, shareId, viewerUid, subPath) {
+    // FIX: flag ini HANYA diset true oleh tick polling tepat sebelum
+    // memanggil fungsi ini (lihat startSharedPolling) -- dibaca lalu
+    // langsung direset di sini supaya panggilan LAIN ke fungsi ini (navigasi
+    // manual pindah folder, dsb.) tetap dapat animasi masuk seperti biasa.
+    const suppressEntranceAnim = sharedIsRealtimeRefresh;
+    sharedIsRealtimeRefresh = false;
     sharedCurrentPath = subPath || '';
     sharedCurrentFolderName = res.item.name;
     sharedContentsCache = res.item.contents || { subfolders: [], files: [] };
@@ -4933,16 +4884,6 @@ async function renderSharedFolderBody(res, shareId, viewerUid, subPath) {
     renderSharedBreadcrumb(Object.assign({ ownerId: pendingShareResolved ? pendingShareResolved.ownerId : res.ownerId, ownerName: pendingShareResolved ? pendingShareResolved.ownerName : res.ownerName }, res), subPath);
 
     const body = document.getElementById('shared-body');
-    // ANIMASI: kartu hanya "naik" (fadeSlideUp) saat pertama masuk / pindah folder.
-    // Saat data cuma ter-refresh (polling/upload/rename) di folder yang sama, animasi
-    // dimatikan supaya tidak naik-turun; item BARU cukup fade-in halus.
-    const renderKey = String(shareId) + '|' + sharedPathSegments.join('/');
-    const isRefresh = (sharedLastRenderKey === renderKey) && !!body.querySelector('#shared-file-grid');
-    sharedLastRenderKey = renderKey;
-    const prevKeys = isRefresh ? sharedLastRenderedKeys : null;
-    const nextKeys = new Set();
-    const scroller = document.getElementById('shared-view');
-    const prevScroll = isRefresh && scroller ? scroller.scrollTop : 0;
     body.innerHTML = `
         <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; gap:12px; flex-wrap:wrap;">
             <h2 style="font-size:20px; font-weight:800;">${res.item.name}</h2>
@@ -4961,6 +4902,8 @@ async function renderSharedFolderBody(res, shareId, viewerUid, subPath) {
         <div class="file-grid" id="shared-file-grid"></div>`;
 
     const folderGrid = document.getElementById('shared-folder-grid');
+    const fileGrid = document.getElementById('shared-file-grid');
+    if (suppressEntranceAnim) { folderGrid.classList.add('no-entrance-anim'); fileGrid.classList.add('no-entrance-anim'); }
     const subfolders = sharedContentsCache.subfolders || [];
     if (subfolders.length === 0) folderGrid.style.display = 'none'; else folderGrid.style.display = 'grid';
     subfolders.forEach(sf => {
@@ -4981,12 +4924,9 @@ async function renderSharedFolderBody(res, shareId, viewerUid, subPath) {
             if (sharedIsSelecting) { const chk = card.querySelector('.folder-checkbox'); chk.checked = !chk.checked; toggleSharedFolderSelect(e, sf, chk); }
             else enterSharedSubfolder(sf.split('/').pop());
         });
-        nextKeys.add('d:' + sf);
-        if (prevKeys && !prevKeys.has('d:' + sf)) card.classList.add('card-new');
         folderGrid.appendChild(card);
     });
 
-    const fileGrid = document.getElementById('shared-file-grid');
     const files = sharedContentsCache.files || [];
     if (files.length === 0 && subfolders.length === 0) { fileGrid.innerHTML = `<div style="grid-column:1/-1; text-align:center; padding:60px 20px; color:var(--text-muted); font-size:14px;">Tidak ada berkas di sini.</div>`; }
     files.forEach(f => {
@@ -5008,14 +4948,9 @@ async function renderSharedFolderBody(res, shareId, viewerUid, subPath) {
             if (sharedIsSelecting) { const chk = card.querySelector('.file-checkbox'); chk.checked = !chk.checked; toggleSharedSelect(e, f.id, chk); }
             else openSharedFilePreviewModal(f, shareId, viewerUid);
         });
-        nextKeys.add('f:' + f.id);
-        if (prevKeys && !prevKeys.has('f:' + f.id)) card.classList.add('card-new');
         fileGrid.appendChild(card);
         if (IMAGE_EXTENSIONS.has(ext) || VIDEO_EXTENSIONS.has(ext)) loadSharedCardThumbnail(f, ext, `shared-thumb-${f.id}`, shareId, viewerUid);
     });
-    sharedLastRenderedKeys = nextKeys;
-    markCardsSettled_();
-    if (isRefresh && scroller) scroller.scrollTop = prevScroll;
     updateSharedSelectionToolbar();
 }
 
@@ -6171,7 +6106,7 @@ function exitSharedView() {
     document.getElementById('share-login-prompt').style.display = 'none';
     sharedLoginPromptDismissed = false;
     const ownerIdToRestore = preShareOwnerId;
-    pendingShareCode = null; pendingShareResolved = null; sharedRootItem = null; sharedCurrentPath = ''; sharedLastRenderKey = null;
+    pendingShareCode = null; pendingShareResolved = null; sharedRootItem = null; sharedCurrentPath = '';
     sharedViewerUid = ''; preShareOwnerId = ''; preShareUser = '';
     window.history.replaceState({}, document.title, location.origin + location.pathname);
 
