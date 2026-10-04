@@ -300,6 +300,19 @@ let isOwnRealtimeRefresh = false;
 // di-rename dari perangkat lain -- segmen nama relatif tidak, karena root
 // selalu dihitung ulang segar tiap kali (lihat navigateSharedTo & polling).
 let sharedPathSegments = [];
+// FIX BUG "PINDAH FOLDER SENDIRI": tick polling (berjalan tiap ~1 detik di
+// latar belakang) dan navigasi manual (klik folder/breadcrumb) sama-sama
+// melakukan beberapa await berurutan sebelum akhirnya memanggil
+// renderSharedFolderBody(). Kalau user KLIK PINDAH FOLDER LAGI sementara
+// tick lama itu masih di tengah jalan, tick lama itu bisa saja BARU selesai
+// belakangan dan menimpa balik tampilan ke folder LAMA -- kelihatan seperti
+// "pindah folder sendiri". Counter ini dinaikkan tiap kali ada navigasi
+// BARU (manual maupun otomatis mundur ke root); setiap alur async (tick
+// polling & navigateSharedTo) menyimpan nilainya di awal, dan sebelum
+// benar2 me-render hasil akhirnya, dicek dulu apakah counter ini masih
+// sama -- kalau sudah berubah (ada navigasi lain yang lebih baru), hasil
+// yang basi itu dibuang begitu saja, tidak jadi dirender.
+let sharedNavEpoch = 0;
 let sharedPollTimer = null;
 let sharedLoginPromptDismissed = false;
 let sharedSelectedIds = new Set();
@@ -309,7 +322,6 @@ let sharedContentsCache = { subfolders: [], files: [] };
 let sharedCurrentFolderName = '';
 let sharedDownloadCancelled = false;
 const SHARE_POLL_INTERVAL_MS = 1000;
-let sharedDataSignature = null;
 
 let globalAbortController = null;
 let currentActiveXhr = null;
@@ -854,37 +866,23 @@ async function callGasAPIFetch(action, payload = {}) {
 // e.parameter.payload) supaya respons aslinya bisa dibaca, dan endpoint bisa
 // di-fallback kalau salah satu limit/gagal -- sama seperti callGasAPI.
 // ==========================================
-// FIX BUG NYATA: sebelumnya pakai fetch() untuk POST ke GAS. Google Apps
-// Script Web App SELALU membalas permintaan awal dengan redirect 302 ke URL
-// eksekusi sebenarnya (script.googleusercontent.com) -- dan sesuai spesifikasi
-// fetch(), redirect 301/302 pada method POST diubah paksa jadi GET TANPA BODY
-// oleh browser. Akibatnya sesekali (tergantung timing/cache Google) request
-// yang sampai ke server itu GET kosong -> e.parameter.data & e.parameter.payload
-// dua-duanya kosong -> "Tidak ada data yang dikirim", PADAHAL upload
-// chunk-nya sendiri sudah sukses duluan (makanya UI kadang sempat menampilkan
-// filenya lewat polling gviz walau pesan error ini muncul). XMLHttpRequest
-// (dipakai di sini) mempertahankan method POST & body-nya lewat redirect,
-// jadi tidak kena masalah ini.
-function saveMetadataOnce_(gasUrl, action, payload) {
+// CATATAN: sempat dicoba ganti ke XMLHttpRequest di sini untuk menghindari
+// GAS yang kadang kehilangan body POST saat redirect 302 -> GET. Ternyata
+// itu malah bikin REGRESI LEBIH PARAH: upload jadi macet/stuck di 100% di
+// banyak perangkat (terutama Safari/iPhone). Dikembalikan ke fetch() biasa;
+// kasus "gagal palsu" (data sebenarnya tersimpan tapi responsnya dianggap
+// gagal) sekarang ditangani lewat verifikasi get_chunks di pemanggilnya
+// (lihat uploadOneFileWorker/fungsi penyimpanan metadata) sebagai jaring
+// pengaman, tanpa mengubah jalur utama yang sudah terbukti jalan.
+async function saveMetadataOnce_(gasUrl, action, payload) {
     payload.action = action; payload.apiKey = GAS_API_KEY;
-    return new Promise((resolve) => {
-        try {
-            const xhr = new XMLHttpRequest();
-            xhr.open('POST', gasUrl, true);
-            xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
-            xhr.timeout = 30000;
-            xhr.onload = () => {
-                if (xhr.status < 200 || xhr.status >= 300) { resolve({ success: false, message: 'Gagal terhubung ke server.', networkError: true }); return; }
-                try { resolve(JSON.parse(xhr.responseText)); }
-                catch (e) { resolve({ success: false, message: 'Respons server tidak valid.', networkError: true }); }
-            };
-            xhr.onerror = () => resolve({ success: false, message: 'Koneksi terputus, coba lagi nanti.', networkError: true });
-            xhr.ontimeout = () => resolve({ success: false, message: 'Koneksi terputus, coba lagi nanti.', networkError: true });
-            xhr.send('payload=' + encodeURIComponent(JSON.stringify(payload)));
-        } catch (e) {
-            resolve({ success: false, message: 'Koneksi terputus, coba lagi nanti.', networkError: true });
-        }
-    });
+    try {
+        const res = await fetch(gasUrl, { method: 'POST', body: new URLSearchParams({ payload: JSON.stringify(payload) }) });
+        if (!res.ok) return { success: false, message: 'Gagal terhubung ke server.', networkError: true };
+        return await res.json();
+    } catch (e) {
+        return { success: false, message: 'Koneksi terputus, coba lagi nanti.', networkError: true };
+    }
 }
 
 async function saveMetadataViaForm(payload, action = "save_metadata") {
@@ -4202,242 +4200,226 @@ function hideSharedUploadFab() {
     if (fab) fab.style.display = 'none';
 }
 
-// FIX BUG "404 PALSU / DATA BASI SAAT RENAME": gviz (Google Sheets) punya cache
-// internal di sisi Google yang bisa basi sampai puluhan detik SETELAH ada
-// tulisan baru (rename folder, ubah privasi, dst). ADA 2 GEJALA berbeda dari
-// staleness ini, dan dua-duanya ditangani di sini:
-//  1) "Gagal palsu" -- gviz sesaat gak nemu baris share/foldernya (padahal
-//     linknya valid) -> dulu langsung divonis 404 di tick itu juga.
-//  2) "Sukses tapi basi" -- gviz TETAP berhasil balikin data, tapi datanya
-//     masih snapshot LAMA (nama folder lama, dst) -- ini TIDAK pernah masuk
-//     jalur error sama sekali, jadi sebelumnya gak ada yang mengoreksinya;
-//     ditunggu berapa lama pun kalau gviz kebetulan tetap konsisten
-//     menyajikan snapshot lama, datanya gak akan pernah berubah sendiri.
-// Solusinya BUKAN "tunggu N kali gagal dulu baru boleh dipercaya" (itu cuma
-// menunda gejala #1 dan sama sekali gak menyentuh gejala #2). Solusinya:
-// begitu gviz kelihatan gagal, LANGSUNG konfirmasi SEKALI ke GAS (baca
-// Spreadsheet live, bukan cache) -- bukan nunggu/coba-coba ulang berkali2.
-// Dan supaya gejala #2 juga ketangkep, tiap beberapa detik dipaksa 1x baca
-// live ke GAS juga WALAU tick sebelumnya "sukses" -- ini yang bikin rename
-// beneran ke-refresh dalam hitungan detik, bukan nunggu cache gviz habis
-// sendiri (yang kadang gak pernah habis-habis kalau nasib snapshotnya apes).
-const SHARED_FORCE_LIVE_EVERY_TICKS = 4; // paksa baca live tiap ~4 detik, terlepas dari sukses/gagalnya gviz
+// ==========================================
+// ARSITEKTUR BARU (DISEDERHANAKAN TOTAL)
+// ==========================================
+// Dulu: setiap tick bisa melakukan BANYAK pemanggilan jaringan berurutan
+// (gviz dulu, lalu forceLive tiap 4 tick, lalu confirm-kalau-kosong, lalu
+// ancestor-fallback per-level kalau gagal...) -- berlapis-lapis, saling
+// menambal, dan jadi sumber bug sendiri (race antar-lapisan itulah yang
+// bikin "pindah folder sendiri" & "stuck").
+//
+// Sekarang: SATU var global (sharedUI) menyimpan SATU-SATUNYA salinan
+// tampilan shared yang sedang aktif, dan SATU fungsi interval (tiap 1
+// detik) yang:
+//   1. Ambil SATU kali data mentah (fetchRawSheets -- gviz, murah, gak
+//      kena kuota GAS).
+//   2. Resolusi SELURUH tampilan (termasuk "jalan turun" dari root
+//      mengikuti sharedPathSegments, berhenti di level terakhir yang
+//      masih valid kalau ada folder perantara yang baru di-rename) murni
+//      di memori lewat resolveSharedViewFromRaw(), TANPA request
+//      tambahan apa pun.
+//   3. Filter hasilnya jadi signature yang benar2 cuma berisi apa yang
+//      ditampilkan, dan BANDINGKAN ke sharedUI.signature.
+//   4. Kalau SAMA -> tidak ngapa-ngapain sama sekali (gak render ulang,
+//      gak ada animasi, gak ada kedip).
+//   5. Kalau BEDA -> baru sharedUI diperbarui & tampilan di-render ulang.
+// Staleness cache gviz (beberapa detik) jadi tidak masalah lagi -- tick
+// berikutnya otomatis mengoreksi begitu cache-nya menyusul, tanpa perlu
+// logic "confirm" khusus sama sekali.
+// Resolver MURNI (tidak melakukan request jaringan apa pun) -- SATU-SATUNYA
+// tempat menerjemahkan data mentah (raw, hasil fetchRawSheets) jadi tampilan
+// shared untuk 1 kode share + 1 posisi path tertentu. Dipakai oleh tick
+// polling (startSharedPolling) dan navigasi manual (navigateSharedTo),
+// supaya keduanya selalu konsisten lewat satu jalur logika yang sama.
+//
+// Untuk folder: path diresolusi dengan "jalan turun" dari root MENGIKUTI
+// pathSegments (nama relatif) satu level demi satu level, dan BERHENTI di
+// level terakhir yang masih benar2 ada di data. Ini otomatis menangani
+// folder perantara yang baru saja di-rename/dipindah pemiliknya, tanpa
+// perlu percobaan/fallback terpisah -- cukup 1 kali jalan, semua di memori.
+function resolveSharedViewFromRaw(raw, shareCode, viewerUid, pathSegments) {
+    if (!raw || !raw.sharesRows) return { ok: false, notFound: true };
+    const shareRow = raw.sharesRows.find(r => String(r[0] || '').trim() === String(shareCode || '').trim());
+    if (!shareRow) return { ok: false, notFound: true };
 
-// FIX BUG "404 SAAT FOLDER PERANTARA DI-RENAME": mekanisme forceLive di atas
-// (lihat komentar di startSharedPolling) cuma menjamin ROOT folder yang
-// dibagikan selalu diresolusi segar -- tapi sharedPathSegments (nama-nama
-// folder di antara root dan folder yang lagi dibuka) tetap dipakai APA
-// ADANYA. Kalau yang di-rename BUKAN root share itu sendiri, tapi salah
-// satu folder PERANTARA di antaranya, nama lama itu bikin path hasil
-// gabungan jadi tidak valid lagi walau isinya sendiri masih ada. Fungsi ini
-// menelusuri dari root TURUN level demi level (bukan path absolut sekali
-// jalan) supaya level mana pun yang masih valid tetap dipakai, dan baru
-// berhenti persis di folder terakhir yang namanya benar-benar sudah
-// berubah/hilang -- isinya tetap ditampilkan dengan benar (walau mungkin di
-// level yang sedikit lebih tinggi dari posisi semula), bukan 404 mati.
-async function tryResolveWithAncestorFallback(code, viewerUid, segments) {
-    const rootRes = await getSharedDataFromSheets(code, viewerUid, null, true);
-    if (!rootRes || !rootRes.success || !rootRes.authorized || !rootRes.item) return null;
-    let lastGood = { res: rootRes, path: rootRes.item.path, segments: [] };
-    let builtPath = rootRes.item.path;
-    for (let i = 0; i < segments.length; i++) {
-        const candidatePath = builtPath + '/' + segments[i];
-        const candidateRes = await getSharedDataFromSheets(code, viewerUid, candidatePath, true);
-        if (candidateRes && candidateRes.success && candidateRes.authorized) {
-            lastGood = { res: candidateRes, path: candidatePath, segments: segments.slice(0, i + 1) };
-            builtPath = candidatePath;
-        } else break;
+    const itemId = String(shareRow[1] || '').trim();
+    const itemType = String(shareRow[2] || '').trim().toLowerCase();
+    const ownerId = String(shareRow[3] || '').trim();
+    const ownerName = String(shareRow[4] || '').trim();
+    const privacy = String(shareRow[5] || 'private').trim();
+    let allowedUsers = [];
+    try { allowedUsers = JSON.parse(shareRow[6] || '[]'); } catch (e) {}
+    const linkRole = String(shareRow[9] || 'view').trim();
+
+    let activeItemRow = null;
+    if (itemType === 'file') activeItemRow = raw.sheet1Rows.find(r => String(r[0] || '').trim() === itemId && String(r[8] || '').trim() === ownerId);
+    else if (itemType === 'folder') activeItemRow = raw.folderRows.find(r => String(r[0] || '').trim() === itemId && String(r[1] || '').trim() === ownerId);
+
+    if (!activeItemRow) {
+        let trashItemRow = null;
+        if (itemType === 'file') trashItemRow = raw.trashRows.find(r => String(r[0] || '').trim() === itemId && String(r[9] || '').trim() === ownerId);
+        else if (itemType === 'folder') trashItemRow = raw.trashRows.find(r => String(r[0] || '').trim() === itemId && String(r[3] || '').trim() === 'sys_folder' && String(r[9] || '').trim() === ownerId);
+        return {
+            ok: false, deleted: true, ownerId, ownerName, itemType, inTrash: !!trashItemRow,
+            item: trashItemRow ? { id: trashItemRow[0], name: trashItemRow[1], format: trashItemRow[3], folder: trashItemRow[4] } : null
+        };
     }
-    return lastGood;
+
+    const trimmedViewerUid = String(viewerUid || '').trim();
+    let authorized = true;
+    if (privacy === 'private' && trimmedViewerUid !== ownerId) authorized = false;
+    if (privacy === 'restricted' && trimmedViewerUid !== ownerId && !allowedUsers.some(u => String(u.uid).trim() === trimmedViewerUid)) authorized = false;
+    if (!authorized) return { ok: true, authorized: false, privacy, ownerId, ownerName };
+
+    let role = 'view';
+    if (privacy === 'link') role = linkRole === 'edit' ? 'edit' : 'view';
+    else if (privacy === 'restricted') {
+        const match = allowedUsers.find(u => String(u.uid).trim() === trimmedViewerUid);
+        role = (match && match.role === 'edit') ? 'edit' : 'view';
+    }
+
+    if (itemType === 'file') {
+        return {
+            ok: true, authorized: true, itemType: 'file', ownerId, ownerName, role,
+            item: { id: activeItemRow[0], name: activeItemRow[1], originalName: activeItemRow[2], format: activeItemRow[3], folder: activeItemRow[4], size: activeItemRow[5], thumbId: activeItemRow[6] }
+        };
+    }
+
+    // --- FOLDER: siapkan sekali set semua folder milik owner ini, dipakai
+    // untuk jalan turun segmen demi segmen DAN membangun daftar subfolder.
+    const allFolders = new Set();
+    raw.folderRows.forEach(r => { if (String(r[1] || '').trim() === ownerId && r[0]) allFolders.add(String(r[0]).trim()); });
+    raw.sheet1Rows.forEach(r => {
+        const fPath = String(r[4] || '').trim();
+        if (String(r[8] || '').trim() === ownerId && fPath && fPath !== '#*null*#') allFolders.add(fPath);
+    });
+    const allFoldersLower = Array.from(allFolders).map(f => f.toLowerCase());
+
+    const rootPath = itemId;
+    let resolvedPath = rootPath;
+    let resolvedSegments = [];
+    for (let i = 0; i < (pathSegments || []).length; i++) {
+        const candidate = resolvedPath + '/' + pathSegments[i];
+        if (!allFoldersLower.includes(candidate.toLowerCase())) break;
+        resolvedPath = candidate;
+        resolvedSegments.push(pathSegments[i]);
+    }
+
+    const contents = { subfolders: [], files: [] };
+    allFolders.forEach(f => {
+        if (f.toLowerCase().startsWith(resolvedPath.toLowerCase() + '/') && f.toLowerCase() !== resolvedPath.toLowerCase()) {
+            const rel = f.substring(resolvedPath.length + 1);
+            const nextSeg = rel.split('/')[0];
+            if (nextSeg) {
+                const fullSub = resolvedPath + '/' + nextSeg;
+                if (!contents.subfolders.some(s => s.toLowerCase() === fullSub.toLowerCase())) contents.subfolders.push(fullSub);
+            }
+        }
+    });
+    raw.sheet1Rows.forEach(r => {
+        let fileFolder = String(r[4] || '').trim(); if (fileFolder === '#*null*#') fileFolder = '';
+        if (String(r[8] || '').trim() === ownerId && fileFolder.toLowerCase() === resolvedPath.toLowerCase()) {
+            contents.files.push({ id: String(r[0]), name: String(r[1]), originalName: String(r[2]), format: String(r[3]), folder: r[4], size: r[5], thumbId: r[6] });
+        }
+    });
+
+    const subfolderShares = {}, fileShares = {};
+    (raw.sharesRows || []).forEach(r => {
+        if (String(r[3] || '').trim() !== ownerId) return;
+        const sInfo = { shareId: r[0], privacy: String(r[5] || 'private').trim() };
+        const sType = String(r[2] || '').trim().toLowerCase();
+        if (sType === 'folder') subfolderShares[String(r[1] || '').trim()] = sInfo;
+        else if (sType === 'file') fileShares[String(r[1] || '').trim()] = sInfo;
+    });
+
+    return {
+        ok: true, authorized: true, itemType: 'folder', ownerId, ownerName, role,
+        path: resolvedPath, pathSegments: resolvedSegments, truncated: resolvedSegments.length !== (pathSegments || []).length,
+        item: { path: resolvedPath, name: resolvedPath.split('/').pop() || 'Beranda', contents, subfolderShares, fileShares }
+    };
 }
+
+let sharedUI = { signature: null };
 
 function startSharedPolling(code) {
     stopSharedPolling();
-    sharedDataSignature = null;
+    sharedUI = { signature: null };
     sharedHasRenderedOnce = false;
-    let tickCount = 0;
-    
+
     sharedPollTimer = setInterval(async () => {
         if (pendingShareCode !== code || document.getElementById('shared-view').style.display === 'none') { stopSharedPolling(); return; }
 
-        // FIX BUG "PROSES UPLOAD DIBATALKAN TERUS": polling realtime ini jalan
-        // tiap 1 detik dan sebelumnya BISA memutus proses upload yang sedang
-        // berjalan di folder yang sama -- setiap kali hasil resolve_share
-        // "kelihatan" gagal/tidak authorized (termasuk cuma karena hiccup
-        // sesaat pembacaan gviz saat trafik upload lagi tinggi), tick ini
-        // langsung stopSharedPolling() + abort(globalAbortController) +
-        // renderShare404()/renderSharedAuthWall(), padahal itemnya baik-baik
-        // saja. Sekarang selama upload ke folder share ini masih berjalan,
-        // tick realtime dilewati dulu (bukan dimatikan -- cuma ditunda),
-        // supaya proses upload tidak pernah diinterupsi di tengah jalan.
+        // Selama upload ke folder share ini masih berjalan, tick realtime
+        // dilewati dulu (bukan dimatikan -- cuma ditunda) supaya tidak
+        // mengganggu progres upload yang sedang jalan.
         if (isUploadInProgress && sharedUploadActive) return;
 
-        tickCount++;
-        // Setiap beberapa tick, paksa lewati gviz sama sekali dan baca
-        // langsung dari GAS -- ini yang menangkap kasus "sukses tapi basi"
-        // (gejala #2 di atas) yang gak pernah ketahuan dari sisi gagal/sukses.
-        const forceLive = (tickCount % SHARED_FORCE_LIVE_EVERY_TICKS === 0);
+        // Simpan epoch navigasi SEKARANG, sebelum fetch di bawah berjalan --
+        // dicek lagi sebelum hasilnya diterapkan, supaya kalau user sudah
+        // pindah folder lain selagi fetch ini masih berjalan, hasil basi ini
+        // dibuang (lihat catatan di deklarasi sharedNavEpoch).
+        const tickEpoch = sharedNavEpoch;
 
-        // FIX BUG "STUCK SAAT RENAME/PRIVASI DIUBAH SAAT SEDANG DIBUKA": sama
-        // seperti di navigateSharedTo() -- sharedCurrentPath (path absolut)
-        // basi begitu root/leluhurnya di-rename dari perangkat lain, dan query
-        // dengan path basi itu balas "berhasil tapi kosong", bukan error, jadi
-        // gak pernah tertangkap sebagai kegagalan. Di tick forceLive, root
-        // diresolusi ulang segar dulu (subPath=null -> selalu baca sh.itemId
-        // yang live) lalu digabung dengan sharedPathSegments (nama relatif)
-        // untuk mendapatkan path query yang BENAR-BENAR terkini. Tick biasa
-        // (bukan forceLive) tetap pakai path yang sudah diketahui supaya tidak
-        // menggandakan request tiap detik -- staleness-nya sendiri terkoreksi
-        // di tick forceLive berikutnya (maksimal ~4 detik).
-        let queryPath = sharedCurrentPath;
-        if (forceLive) {
-            const rootRes = await getSharedDataFromSheets(code, sharedViewerUid, null, true);
-            if (rootRes && rootRes.success && rootRes.authorized && rootRes.item) {
-                queryPath = sharedPathSegments.length ? (rootRes.item.path + '/' + sharedPathSegments.join('/')) : rootRes.item.path;
-            }
-        }
+        const raw = await fetchRawSheets().catch(() => null);
+        if (!raw) return; // hiccup jaringan sesaat -- coba lagi tick berikutnya, jangan ubah apa pun
 
-        let res = await getSharedDataFromSheets(code, sharedViewerUid, queryPath, forceLive);
+        const r = resolveSharedViewFromRaw(raw, code, sharedViewerUid, sharedPathSegments);
+        if (tickEpoch !== sharedNavEpoch) return; // ada navigasi lain yang lebih baru -- buang hasil ini
 
-        // FIX: cache gviz (Google Sheets published-web query) kadang lebih
-        // lambat mengikuti perubahan (rename/hapus/upload) dibanding baca
-        // langsung ke GAS -- akibatnya folder yang BARU di-rename bisa
-        // sesaat terlihat "Tidak ada berkas di sini" (baris filenya masih
-        // memuat snapshot path LAMA di cache gviz), padahal isinya
-        // sebenarnya ada. Kalau hasil non-forceLive kelihatan KOSONG,
-        // JANGAN langsung percaya path yang dipakai barusan (queryPath) --
-        // itu juga bisa saja path LAMA yang belum sempat ter-update kalau
-        // root/folder perantaranya baru saja di-rename. Hitung ulang dulu
-        // path yang BENAR-benar terkini dari root (sama seperti tick
-        // forceLive), baru konfirmasi ke sumber live (GAS, tanpa cache)
-        // pakai path segar itu -- supaya tidak "kedip kosong lalu balik".
-        const emptyLooking = res && res.success && res.authorized && res.itemType === 'folder' && res.item && res.item.contents &&
-            res.item.contents.subfolders.length === 0 && res.item.contents.files.length === 0;
-        if (!forceLive && emptyLooking) {
-            const freshRootRes = await getSharedDataFromSheets(code, sharedViewerUid, null, true);
-            const freshPath = (freshRootRes && freshRootRes.success && freshRootRes.authorized && freshRootRes.item)
-                ? (sharedPathSegments.length ? (freshRootRes.item.path + '/' + sharedPathSegments.join('/')) : freshRootRes.item.path)
-                : queryPath;
-            const liveConfirm = await getSharedDataFromSheets(code, sharedViewerUid, freshPath, true);
-            if (liveConfirm && liveConfirm.success) { res = liveConfirm; queryPath = freshPath; }
-        }
-        
-        // Kalau gviz (bukan forceLive) kelihatan gagal/dihapus/tidak authorized,
-        // JANGAN langsung divonis -- konfirmasi SEKALI SAJA ke sumber live (GAS)
-        // sebelum dipercaya. Bukan retry berkali-kali/nunggu beberapa detik --
-        // cukup 1x cek ke sumber yang gak ada cache-nya sama sekali, hasilnya
-        // langsung final (dipakai apa adanya, sukses maupun gagal).
-        if (!forceLive && (!res || !res.success || res.deleted || !res.authorized)) {
-            res = await getSharedDataFromSheets(code, sharedViewerUid, sharedCurrentPath, true);
-        }
-
-        // Sebelum divonis 404/tidak authorized, kalau kita SEDANG browsing
-        // lebih dalam dari root share (bukan pas root-nya sendiri), coba
-        // dulu telusuri dari root turun level demi level -- ini menangkap
-        // kasus folder PERANTARA (bukan root) yang di-rename, supaya isinya
-        // tetap ditampilkan (bukan 404), lihat catatan di
-        // tryResolveWithAncestorFallback().
-        if ((!res || !res.success || res.deleted || !res.authorized) && sharedPathSegments.length > 0) {
-            const fallback = await tryResolveWithAncestorFallback(code, sharedViewerUid, sharedPathSegments);
-            if (fallback) {
-                res = fallback.res;
-                queryPath = fallback.path;
-                if (fallback.segments.length !== sharedPathSegments.length) {
-                    sharedPathSegments = fallback.segments;
-                    showToast("Salah satu folder di jalur ini sudah diganti nama/dipindah pemiliknya — ditampilkan dari folder terdekat yang masih ada.", true);
-                }
-            }
-        }
-
-        // JIKA FILE DIHAPUS / PINDAH KE SAMPAH (sudah dikonfirmasi live, final)
-        if (!res || !res.success || res.deleted) { 
-            stopSharedPolling(); 
-            closePreviewModal(); 
-            hideSharedUploadFab();
-            
-            // --- KUNCI PEMBATALAN DOWNLOAD OTOMATIS ---
+        if (!r.ok && r.notFound) return; // jangan langsung 404 dari 1 kali baca gviz basi -- tunggu tick berikutnya
+        if (!r.ok && r.deleted) {
+            stopSharedPolling(); closePreviewModal(); hideSharedUploadFab();
             sharedDownloadCancelled = true;
-            if (globalAbortController) { 
-                globalAbortController.abort(); // Hentikan paksa proses download/zip!
-                globalAbortController = null; 
-            }
+            if (globalAbortController) { globalAbortController.abort(); globalAbortController = null; }
             hideLoadingOverlay();
-            // ------------------------------------------
-            
-            renderShare404(); 
-            return; 
+            renderShare404();
+            return;
         }
-        
-        // JIKA HAK AKSES DICABUT / DIBATASI (sudah dikonfirmasi live, final --
-        // berlaku untuk SEMUA jenis privasi, bukan cuma 'restricted').
-        if (!res.authorized) { 
-            stopSharedPolling(); 
-            closePreviewModal(); 
-            hideSharedUploadFab();
-            
-            // --- KUNCI PEMBATALAN DOWNLOAD OTOMATIS ---
+        if (r.ok && !r.authorized) {
+            stopSharedPolling(); closePreviewModal(); hideSharedUploadFab();
             sharedDownloadCancelled = true;
-            if (globalAbortController) { 
-                globalAbortController.abort(); // Hentikan paksa proses download/zip!
-                globalAbortController = null; 
-            }
+            if (globalAbortController) { globalAbortController.abort(); globalAbortController = null; }
             hideLoadingOverlay();
-            // ------------------------------------------
-
-            // FIX: kalau pengguna SEDANG mengupload lewat halaman share ini
-            // dan pemilik mendadak mengganti privasinya (dicabut/dibatasi),
-            // upload yang sedang berjalan harus langsung terbatal juga --
-            // dulu upload ini pakai jalur XHR/antrean sendiri (bukan
-            // globalAbortController di atas) jadi tetap lanjut walau
-            // akses sudah dicabut.
             if (sharedUploadActive && isUploadInProgress) {
                 closeUploadModal();
                 showToast("Upload dibatalkan: akses ke folder ini baru saja dicabut/diubah pemiliknya.", true);
             }
-            
-            renderSharedAuthWall(res); 
-            return; 
+            renderSharedAuthWall(r);
+            return;
         }
+        if (!r.ok) return; // bentuk kegagalan lain yang tak terduga -- aman diabaikan, dicoba lagi tick berikutnya
 
-        // FIX: sama seperti di atas, tapi untuk kasus akses masih authorized
-        // namun perannya TURUN dari 'edit' ke 'view' (mis. pemilik mengganti
-        // linkRole atau menurunkan peran orang yang diberi akses manual) --
-        // upload yang sedang berjalan harus ikut terbatal juga, bukan
-        // dibiarkan lanjut sampai selesai.
-        if (sharedUploadActive && isUploadInProgress && res.role !== 'edit') {
+        if (sharedUploadActive && isUploadInProgress && r.role !== 'edit') {
             closeUploadModal();
             showToast("Upload dibatalkan: akses Edit Anda di folder ini baru saja dicabut pemiliknya.", true);
         }
+        if (r.itemType === 'folder' && r.truncated) {
+            showToast("Salah satu folder di jalur ini sudah diganti nama/dipindah pemiliknya — ditampilkan dari folder terdekat yang masih ada.", true);
+        }
 
-        pendingShareResolved = Object.assign({}, pendingShareResolved, res);
-
-        // Update peran (view/edit) tiap detik walau isi folder tidak berubah,
-        // supaya tombol "+" realtime mengikuti perubahan yang di-set pemilik.
-        if (res.itemType === 'folder') updateSharedUploadFab(res.role, code, sharedViewerUid);
+        pendingShareResolved = Object.assign({}, pendingShareResolved, { success: true, authorized: true, itemType: r.itemType, ownerId: r.ownerId, ownerName: r.ownerName, role: r.role, item: r.item });
+        if (r.itemType === 'folder') { updateSharedUploadFab(r.role, code, sharedViewerUid); sharedPathSegments = r.pathSegments; }
         else hideSharedUploadFab();
 
-        const currentSig = JSON.stringify({ item: res.item });
-        if (sharedDataSignature !== currentSig) {
-            sharedDataSignature = currentSig;
-            if (!sharedIsSelecting && res.itemType === 'folder') {
-                sharedIsRealtimeRefresh = sharedHasRenderedOnce;
-                sharedHasRenderedOnce = true;
-                await renderSharedFolderBody(res, code, sharedViewerUid, queryPath);
-                // FIX REALTIME: kalau ada modal preview file yang lagi
-                // terbuka sambil browsing folder share ini, judulnya dulu
-                // TIDAK pernah ikut disinkronkan waktu pemilik rename/hapus
-                // file itu dari perangkat lain. Disamakan di sini juga.
-                refreshOpenSharedPreviewMetaIfNeeded();
-            } else if (res.itemType === 'file') {
-                // FIX REALTIME: dulu perubahan pada file (mis. nama diganti
-                // pemilik) tidak pernah ke-refresh sama sekali di sini --
-                // signature-nya sempat dihitung ulang tapi tidak pernah
-                // dipakai untuk apa pun kalau itemType 'file'. Sekarang judul
-                // & ukurannya diperbarui langsung TANPA mengulang proses
-                // unduh/pratinjau berkas (supaya tidak boros kuota & tidak
-                // memutus pratinjau yang sedang berjalan).
-                updateSharedFileMetaDisplay(res.item);
-            }
+        // FILTER: signature cuma dibangun dari field yang BENAR2 ditampilkan,
+        // supaya tidak re-render untuk perubahan yang tidak relevan.
+        const filtered = r.itemType === 'folder'
+            ? { t: 'folder', path: r.path, role: r.role, item: r.item }
+            : { t: 'file', role: r.role, item: r.item };
+        const sig = JSON.stringify(filtered);
+        if (sig === sharedUI.signature) return; // tidak ada perubahan -- diamkan saja, tidak render ulang
+
+        sharedUI = { signature: sig, itemType: r.itemType, path: r.itemType === 'folder' ? r.path : null, role: r.role, item: r.item };
+
+        if (sharedIsSelecting) return;
+        if (r.itemType === 'folder') {
+            sharedIsRealtimeRefresh = sharedHasRenderedOnce;
+            sharedHasRenderedOnce = true;
+            await renderSharedFolderBody({ ownerId: r.ownerId, ownerName: r.ownerName, itemType: 'folder', item: r.item, role: r.role }, code, sharedViewerUid, r.path);
+            refreshOpenSharedPreviewMetaIfNeeded();
+        } else {
+            updateSharedFileMetaDisplay(r.item);
         }
     }, 1000);
 }
@@ -4552,11 +4534,13 @@ function renderSharedBreadcrumb(res, subPath) {
 // Masuk satu level ke subfolder yang sedang ditampilkan (dipanggil dari kartu
 // folder). Disimpan sebagai NAMA relatif saja -- lihat catatan sharedPathSegments.
 function enterSharedSubfolder(segmentName) {
+    sharedNavEpoch++;
     sharedPathSegments.push(segmentName);
     navigateSharedTo();
 }
 // Lompat ke level tertentu lewat breadcrumb. depthIndex -1 = kembali ke root.
 function jumpSharedBreadcrumb(depthIndex) {
+    sharedNavEpoch++;
     sharedPathSegments = depthIndex < 0 ? [] : sharedPathSegments.slice(0, depthIndex + 1);
     navigateSharedTo();
 }
@@ -4573,40 +4557,46 @@ function jumpSharedBreadcrumb(depthIndex) {
 // langsung dari sh.itemId, yang dijamin ikut ter-update tiap kali rename_folder_dir
 // jalan -- lihat backend.gs), lalu digabung dengan sharedPathSegments (nama
 // relatif, bukan path absolut) untuk membentuk path query yang sebenarnya.
-async function navigateSharedTo(forceLive) {
+// Dipakai untuk navigasi MANUAL (klik folder/breadcrumb). Satu fetch data
+// mentah + satu resolusi lewat resolveSharedViewFromRaw() -- jalur yang
+// PERSIS SAMA dengan yang dipakai tick polling, supaya seluruh tampilan
+// shared (baik dari interval maupun dari klik langsung) selalu konsisten.
+async function navigateSharedTo() {
+    // Simpan epoch SEKARANG (sudah dinaikkan oleh pemanggil kalau ini navigasi
+    // baru) -- dipakai untuk membatalkan render di akhir fungsi ini kalau
+    // ternyata sudah ada navigasi LAIN yang lebih baru selagi await di bawah
+    // masih berjalan (lihat catatan di deklarasi sharedNavEpoch).
+    const myEpoch = sharedNavEpoch;
     showLoadingOverlay("Membuka folder...", false, false);
-    let rootRes = await getSharedDataFromSheets(pendingShareCode, sharedViewerUid, null, !!forceLive);
-    if (!rootRes || !rootRes.success || !rootRes.authorized) {
-        rootRes = await getSharedDataFromSheets(pendingShareCode, sharedViewerUid, null, true);
-    }
-    if (!rootRes || !rootRes.success || !rootRes.item) {
-        hideLoadingOverlay();
-        if (rootRes && !rootRes.authorized) { renderSharedAuthWall(rootRes); return; }
-        renderShare404();
+    const raw = await fetchRawSheets().catch(() => null);
+    hideLoadingOverlay();
+    if (myEpoch !== sharedNavEpoch) return; // ada navigasi lain yang lebih baru -- buang hasil basi ini
+    if (!raw) { renderShare404(); return; }
+
+    const r = resolveSharedViewFromRaw(raw, pendingShareCode, sharedViewerUid, sharedPathSegments);
+
+    if (!r.ok && r.notFound) { renderShare404(); return; }
+    if (!r.ok && r.deleted) {
+        if (sharedPathSegments.length > 0) {
+            // Bukan root-nya yang hilang, tapi subfolder tempat viewer lagi
+            // berada (dihapus/dipindah pemiliknya) -- mundur ke root, bukan
+            // macet di kosong.
+            sharedNavEpoch++;
+            sharedPathSegments = [];
+            showToast("Folder ini sudah tidak ada lagi, kembali ke folder utama.", true);
+            navigateSharedTo();
+        } else {
+            renderShare404();
+        }
         return;
     }
-    if (!rootRes.authorized) { hideLoadingOverlay(); renderSharedAuthWall(rootRes); return; }
+    if (r.ok && !r.authorized) { renderSharedAuthWall(r); return; }
+    if (!r.ok || r.itemType !== 'folder') { renderShare404(); return; }
 
-    const freshRootPath = rootRes.item.path;
-    const targetPath = sharedPathSegments.length ? (freshRootPath + '/' + sharedPathSegments.join('/')) : freshRootPath;
-
-    let r = (targetPath === freshRootPath) ? rootRes : await getSharedDataFromSheets(pendingShareCode, sharedViewerUid, targetPath);
-    if (targetPath !== freshRootPath && (!r || !r.success || !r.authorized)) {
-        r = await getSharedDataFromSheets(pendingShareCode, sharedViewerUid, targetPath, true);
-    }
-    hideLoadingOverlay();
-    if (r && r.success && r.authorized) {
-        renderSharedFolderBody({ ownerId: pendingShareResolved.ownerId, ownerName: pendingShareResolved.ownerName, itemType: 'folder', item: r.item, role: r.role }, pendingShareCode, sharedViewerUid, targetPath);
-        resetSharedViewScroll();
-    } else if (r && r.deleted && targetPath !== freshRootPath) {
-        // Bukan root-nya yang hilang, tapi subfolder tempat viewer lagi berada
-        // (dihapus/dipindah pemiliknya) -- mundur ke root, bukan macet di kosong.
-        sharedPathSegments = [];
-        showToast("Folder ini sudah tidak ada lagi, kembali ke folder utama.", true);
-        navigateSharedTo(true);
-    } else {
-        renderShare404();
-    }
+    sharedPathSegments = r.pathSegments;
+    pendingShareResolved = Object.assign({}, pendingShareResolved, { success: true, authorized: true, itemType: 'folder', ownerId: r.ownerId, ownerName: r.ownerName, role: r.role, item: r.item });
+    renderSharedFolderBody({ ownerId: r.ownerId, ownerName: r.ownerName, itemType: 'folder', item: r.item, role: r.role }, pendingShareCode, sharedViewerUid, r.path);
+    resetSharedViewScroll();
 }
 
 // Ambil chunks (Telegram file id) sebuah berkas yang dibagikan langsung dari
@@ -6557,3 +6547,4 @@ if ('serviceWorker' in navigator) {
     }
     setInterval(checkDevtools, 1000);
 })();
+
