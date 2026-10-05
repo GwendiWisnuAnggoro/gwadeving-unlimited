@@ -364,6 +364,221 @@ function isInGvizCooldown(scopeKey) {
     } catch (e) { return false; }
 }
 
+// ==========================================
+// VERIFIKASI SETELAH TULIS (rename file/folder, pemilik & shared)
+// ==========================================
+// Server dianggap "sukses" HANYA kalau data barunya benar2 terbaca balik dari
+// server (jalur GAS live, bukan gviz yang bisa basi). Selama verifikasi
+// loading tetap tampil; kalau sampai habis percobaan datanya belum sesuai,
+// hasilnya dianggap GAGAL (tidak ada klaim sukses palsu).
+async function verifyOwnerData_(checkFn, maxTry = 6, delayMs = 800) {
+    let last = null;
+    for (let i = 0; i < maxTry; i++) {
+        const res = await callGasAPI('get_all_data', { ownerId: currentOwnerId });
+        if (res && res.success && res.data) {
+            const d = res.data;
+            if (!d.active) d.active = []; if (!d.trash) d.trash = []; if (!d.folders) d.folders = [];
+            last = d;
+            let ok = false; try { ok = !!checkFn(d); } catch (e) { ok = false; }
+            if (ok) return { ok: true, data: d };
+        }
+        if (i < maxTry - 1) await sleep(delayMs);
+    }
+    return { ok: false, data: last };
+}
+async function verifySharedData_(shareId, viewerUid, subPath, checkFn, maxTry = 6, delayMs = 800) {
+    let last = null;
+    for (let i = 0; i < maxTry; i++) {
+        const res = await callGasAPIFetch('resolve_share', { shareId: shareId, viewerUid: viewerUid, subPath: subPath });
+        if (res && res.success && res.authorized !== false) {
+            last = res;
+            let ok = false; try { ok = !!checkFn(res); } catch (e) { ok = false; }
+            if (ok) return { ok: true, res: res };
+        }
+        if (i < maxTry - 1) await sleep(delayMs);
+    }
+    return { ok: false, res: last };
+}
+
+// ==========================================
+// AKSES EFEKTIF ITEM DI DALAM FOLDER SHARED
+// ==========================================
+// Folder/file di dalam folder yang dibagikan bisa punya pengaturan privasi
+// SENDIRI (single). Aturan: item hanya tampil kalau viewer lolos di SEMUA
+// level (folder utama + tiap folder perantara + item itu sendiri), dan
+// perannya = yang paling ketat di antara semuanya (mis. utama Edit tapi
+// item itu Lihat -> viewer cuma bisa Lihat). Pemilik selalu lolos penuh.
+// CATATAN: ini hanya penyaring tampilan; penegakan sebenarnya tetap harus
+// ada di backend (GAS) pada setiap action shared_*/get_chunks.
+// ==========================================
+// ID FOLDER: share folder hanya berlaku untuk folder yang ID-nya SAMA. Folder baru
+// dengan path yang sama persis dengan folder lama (yang ada di sampah) punya ID
+// berbeda, jadi tidak mewarisi share/privasi folder lama.
+// Data lama tanpa ID tetap dianggap cocok (kompatibel mundur).
+// ==========================================
+function folderIdMapOf_(raw) {
+    if (raw.__fid) return raw.__fid;
+    // kunci owner|path -> Set ID folder aktif di path itu (bisa >1 kalau path ganda hasil pemulihan sampah)
+    const m = new Map();
+    (raw.folderRows || []).forEach(r => {
+        const o = String(r[1] || '').trim(), pth = String(r[0] || '').trim();
+        if (!pth) return;
+        const key = o + '|' + pth.toLowerCase();
+        if (!m.has(key)) m.set(key, new Set());
+        m.get(key).add(String(r[3] || '').trim());
+    });
+    try { Object.defineProperty(raw, '__fid', { value: m, enumerable: false, writable: true, configurable: true }); } catch (e) {}
+    return m;
+}
+// true = baris share ini berlaku untuk salah satu folder aktif di path-nya (atau tidak bisa dipastikan -> biarkan).
+function shareRowMatchesFolder_(raw, row) {
+    if (String(row[2] || '').trim().toLowerCase() !== 'folder') return true;
+    const sid = String(row[10] || '').trim();
+    if (!sid) return true;
+    const ids = folderIdMapOf_(raw).get(String(row[3] || '').trim() + '|' + String(row[1] || '').trim().toLowerCase());
+    if (!ids || ids.size === 0 || ids.has('')) return true;
+    return ids.has(sid);
+}
+
+function sharedBuildAccessIndex_(raw, ownerId) {
+    const folderRows = new Map(), fileRows = new Map();
+    (raw.sharesRows || []).forEach(r => {
+        if (String(r[3] || '').trim() !== ownerId) return;
+        if (!shareRowMatchesFolder_(raw, r)) return; // share milik folder lama -> abaikan
+        const t = String(r[2] || '').trim().toLowerCase();
+        const id = String(r[1] || '').trim();
+        if (t === 'folder') folderRows.set(id.toLowerCase(), r);
+        else if (t === 'file') fileRows.set(id, r);
+    });
+    return { folderRows, fileRows, ownerId };
+}
+function sharedEvalRow_(row, viewerUid, ownerId) {
+    const uid = String(viewerUid || '').trim();
+    if (uid && uid === ownerId) return { ok: true, role: 'edit' };
+    const privacy = String(row[5] || 'private').trim();
+    let allowed = []; try { allowed = JSON.parse(row[6] || '[]'); } catch (e) {}
+    if (privacy === 'private') return { ok: false, role: 'view' };
+    if (privacy === 'restricted') {
+        const m = allowed.find(u => String(u.uid).trim() === uid);
+        if (!m) return { ok: false, role: 'view' };
+        return { ok: true, role: m.role === 'edit' ? 'edit' : 'view' };
+    }
+    return { ok: true, role: String(row[9] || 'view').trim() === 'edit' ? 'edit' : 'view' };
+}
+function sharedMinRole_(a, b) { return (a === 'edit' && b === 'edit') ? 'edit' : 'view'; }
+// Akses efektif ke folder `path` (di bawah rootPath). Root tidak dievaluasi
+// ulang di sini (sudah dievaluasi pemanggil -> rootRole).
+function sharedEffectiveFolderAccess_(idx, rootPath, rootRole, path, viewerUid) {
+    let role = rootRole;
+    const rootLower = rootPath.toLowerCase();
+    const parts = path.substring(rootPath.length).split('/').filter(Boolean);
+    let acc = rootPath;
+    for (let i = 0; i < parts.length; i++) {
+        acc = acc + '/' + parts[i];
+        const row = idx.folderRows.get(acc.toLowerCase());
+        if (!row) continue;
+        const ev = sharedEvalRow_(row, viewerUid, idx.ownerId);
+        if (!ev.ok) return { ok: false, role: 'view' };
+        role = sharedMinRole_(role, ev.role);
+    }
+    return { ok: true, role: role };
+}
+function sharedEffectiveFileAccess_(idx, rootPath, rootRole, fileId, fileFolder, viewerUid) {
+    const fa = sharedEffectiveFolderAccess_(idx, rootPath, rootRole, fileFolder, viewerUid);
+    if (!fa.ok) return fa;
+    const row = idx.fileRows.get(String(fileId).trim());
+    if (!row) return fa;
+    const ev = sharedEvalRow_(row, viewerUid, idx.ownerId);
+    if (!ev.ok) return { ok: false, role: 'view' };
+    return { ok: true, role: sharedMinRole_(fa.role, ev.role) };
+}
+// Foto isi folder level 1 di bawah `path`: lowerName -> {name, ids[]} (dipakai
+// untuk mendeteksi folder yang di-RENAME pemilik, supaya posisi viewer ikut).
+function sharedSnapshotChildren_(raw, ownerId, allFolders, path) {
+    const base = path.toLowerCase() + '/';
+    const kids = {};
+    allFolders.forEach(f => {
+        const fl = f.toLowerCase();
+        if (fl.startsWith(base)) {
+            const seg = f.substring(path.length + 1).split('/')[0];
+            if (seg && !kids[seg.toLowerCase()]) kids[seg.toLowerCase()] = { name: seg, ids: [] };
+        }
+    });
+    raw.sheet1Rows.forEach(r => {
+        if (String(r[8] || '').trim() !== ownerId) return;
+        const ff = String(r[4] || '').trim(); if (!ff || ff === '#*null*#') return;
+        const fl = ff.toLowerCase(); if (!fl.startsWith(base)) return;
+        const seg = ff.substring(path.length + 1).split('/')[0].toLowerCase();
+        if (kids[seg] && kids[seg].ids.length < 30) kids[seg].ids.push(String(r[0]));
+    });
+    return kids;
+}
+function sharedDetectRename_(prevSnap, curSnap, seg) {
+    if (!prevSnap || !curSnap) return null;
+    const key = String(seg).toLowerCase();
+    if (!prevSnap[key]) return null;
+    const removed = Object.keys(prevSnap).filter(k => !curSnap[k]);
+    const added = Object.keys(curSnap).filter(k => !prevSnap[k]);
+    if (!removed.includes(key) || added.length === 0) return null;
+    const oldIds = new Set(prevSnap[key].ids);
+    let best = null, bestScore = 0;
+    added.forEach(k => {
+        const sc = curSnap[k].ids.filter(id => oldIds.has(id)).length;
+        if (sc > bestScore) { bestScore = sc; best = k; }
+    });
+    if (best) return curSnap[best].name;
+    if (added.length === 1 && removed.length === 1) return curSnap[added[0]].name;
+    return null;
+}
+let sharedLevelSnapshots = [];
+
+// ==========================================
+// ANTI-XSS: escape untuk konteks string JS di dalam atribut onclick="fn('...')".
+// escapeHtml() SAJA TIDAK CUKUP di konteks ini (browser men-decode &#39; jadi '
+// sebelum JS dijalankan -> bisa keluar dari string). jsStr() mengubah semua
+// karakter selain huruf/angka/spasi/titik/minus jadi \uXXXX, yang aman
+// ditaruh di atribut HTML maupun literal string JS.
+// ==========================================
+function jsStr(s) {
+    return String(s == null ? '' : s).replace(/[^A-Za-z0-9 .\-]/g, c => '\\u' + ('0000' + c.charCodeAt(0).toString(16)).slice(-4));
+}
+// Kode share dari URL (?share=...) hanya boleh alfanumerik -- cegah reflected XSS lewat link.
+function isValidShareCode_(c) { return /^[A-Za-z0-9]{4,32}$/.test(String(c || '')); }
+
+// ID unik per panggilan logis ke GAS. Dipakai ulang di semua percobaan ulang
+// supaya server tidak mengeksekusi request yang sama 2x (idempotensi).
+function newReqId_() { return 'r' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10); }
+
+// ==========================================
+// DETEKSI KONEKSI + JEDA/LANJUT UPLOAD
+// ==========================================
+function isNetworkishError_(e) {
+    const m = String((e && e.message) || e || '');
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return true;
+    return /Koneksi terputus|Failed to fetch|NetworkError|Load failed|network|HTTP (429|5\d\d)/i.test(m);
+}
+async function probeConnection_() {
+    try {
+        const ac = new AbortController();
+        const t = setTimeout(() => ac.abort(), 5000);
+        await fetch(getRandomWorker() + '/?ping=' + Date.now(), { method: 'GET', mode: 'no-cors', cache: 'no-store', signal: ac.signal });
+        clearTimeout(t);
+        return true;
+    } catch (e) { return false; }
+}
+// Tunggu sampai koneksi benar2 pulih. Return true = pulih, false = dibatalkan/timeout.
+async function waitForConnection_(shouldAbort, maxWaitMs = 20 * 60 * 1000) {
+    const start = Date.now();
+    while (!shouldAbort() && (Date.now() - start) < maxWaitMs) {
+        if (navigator.onLine !== false && await probeConnection_()) return true;
+        await new Promise(r => {
+            const t = setTimeout(r, 2500);
+            window.addEventListener('online', () => { clearTimeout(t); r(); }, { once: true });
+        });
+    }
+    return false;
+}
+
 
 document.addEventListener('DOMContentLoaded', async () => {
     loadAccountsFromStorage();
@@ -572,14 +787,14 @@ function openProfileModal() {
         const item = document.createElement('div');
         item.className = `account-item ${isActive ? 'active-acc' : ''}`;
         item.innerHTML = `
-            <div style="display:flex; align-items:center; gap:12px; flex:1;" onclick="switchAccountByName('${acc.user}')">
+            <div style="display:flex; align-items:center; gap:12px; flex:1;" onclick="switchAccountByName('${jsStr(acc.user)}')">
                 <span class="material-symbols-rounded" style="color: ${isActive ? 'var(--primary)' : 'var(--text-muted)'};">account_circle</span>
                 <div>
-                    <div style="font-size:14px; font-weight:700; color:var(--text-primary);">${acc.user}</div>
-                    <div class="account-uid-tag">ID: ${acc.ownerId}</div>
+                    <div style="font-size:14px; font-weight:700; color:var(--text-primary);">${escapeHtml(acc.user)}</div>
+                    <div class="account-uid-tag">ID: ${escapeHtml(acc.ownerId)}</div>
                 </div>
             </div>
-            <button class="icon-btn" onclick="openEditAccountModal('${acc.user}', event)" title="Opsi Akun"><span class="material-symbols-rounded" style="font-size:22px;">more_vert</span></button>
+            <button class="icon-btn" onclick="openEditAccountModal('${jsStr(acc.user)}', event)" title="Opsi Akun"><span class="material-symbols-rounded" style="font-size:22px;">more_vert</span></button>
         `;
         container.appendChild(item);
     });
@@ -707,7 +922,7 @@ function openActionMenuModal() {
         div.id = 'action-menu-paste-item';
         div.innerHTML = `
             <div class="action-menu-item" onclick="closeActionMenuModal(); pasteClipboardHere();">
-                <span class="material-symbols-rounded" style="color:var(--primary);">content_paste</span><span>Tempel "${clipboardItem.label}" di sini</span>
+                <span class="material-symbols-rounded" style="color:var(--primary);">content_paste</span><span>Tempel "${escapeHtml(clipboardItem.label)}" di sini</span>
             </div>
             <hr style="border: 0; border-top: 1px solid var(--border-color); margin: 6px 0;">`;
         container.insertBefore(div, container.firstChild);
@@ -803,7 +1018,7 @@ function callGasAPIOnce_(gasUrl, action, payload) {
         let isResolved = false;
         const timeoutId = setTimeout(() => {
             if (!isResolved) { isResolved = true; delete window[callbackName]; resolve({ success: false, message: "Koneksi terputus, server sedang sibuk. Coba lagi nanti.", networkError: true }); }
-        }, 15000);
+        }, 30000); // antrean di server bisa menahan request sesaat -- beri waktu lebih lega
         window[callbackName] = function (data) { if (isResolved) return; isResolved = true; clearTimeout(timeoutId); delete window[callbackName]; resolve(data); };
         const script = document.createElement('script');
         script.src = `${gasUrl}?callback=${callbackName}&data=${encodeURIComponent(JSON.stringify(payload))}`;
@@ -818,6 +1033,7 @@ function callGasAPIOnce_(gasUrl, action, payload) {
 // "Username sudah terdaftar!"), supaya pesan error yang relevan tetap
 // sampai ke user apa adanya, bukan malah disembunyikan oleh percobaan ulang.
 async function callGasAPI(action, payload = {}) {
+    payload = { ...payload, reqId: payload.reqId || newReqId_() }; // sama di semua percobaan ulang
     // FIX #4: sebelum benar-benar dianggap error, ulangi seluruh siklus endpoint
     // sampai 3x total (dengan jeda singkat) -- baru kalau SEMUA percobaan gagal
     // karena masalah koneksi/limit, hasil error itu diteruskan ke pemanggil.
@@ -845,6 +1061,7 @@ async function callGasAPIFetchOnce_(gasUrl, action, payload) {
 }
 
 async function callGasAPIFetch(action, payload = {}) {
+    payload = { ...payload, reqId: payload.reqId || newReqId_() };
     // FIX #4: sama seperti callGasAPI -- coba ulang sampai 3x siklus dulu.
     let lastResult = { success: false, message: "Tidak ada endpoint GAS yang terpasang.", networkError: true };
     for (let round = 0; round < 3; round++) {
@@ -886,6 +1103,7 @@ async function saveMetadataOnce_(gasUrl, action, payload) {
 }
 
 async function saveMetadataViaForm(payload, action = "save_metadata") {
+    payload = { ...payload, reqId: payload.reqId || newReqId_() };
     // FIX #4: retry penuh sampai 3x siklus sebelum dianggap gagal permanen.
     let lastResult = { success: false, message: "Tidak ada endpoint GAS yang terpasang.", networkError: true };
     for (let round = 0; round < 3; round++) {
@@ -1042,6 +1260,7 @@ function decryptFolderRows_(rows) {
         const copy = r.slice();
         if (copy.length > 0) copy[0] = decField(copy[0]);
         if (copy.length > 1) copy[1] = decField(copy[1]);
+        if (copy.length > 3) copy[3] = decField(copy[3]); // ID folder
         return copy;
     });
 }
@@ -1052,7 +1271,7 @@ function decryptFolderRows_(rows) {
 function decryptShareRows_(rows) {
     return rows.map(r => {
         const copy = r.slice();
-        [0, 1, 2, 3, 4, 5, 6, 9].forEach(idx => { if (copy.length > idx) copy[idx] = decField(copy[idx]); });
+        [0, 1, 2, 3, 4, 5, 6, 9, 10].forEach(idx => { if (copy.length > idx) copy[idx] = decField(copy[idx]); }); // 10 = ID folder pemilik share
         return copy;
     });
 }
@@ -1122,7 +1341,7 @@ function buildStateArrayFromRaw(raw, ownerId) {
 
     if (raw.sharesRows) {
         raw.sharesRows.forEach(r => {
-            if (String(r[3]) === String(ownerId)) {
+            if (String(r[3]) === String(ownerId) && shareRowMatchesFolder_(raw, r)) {
                 exactShareMap.set(r[1] + '_' + r[2], { shareId: r[0], privacy: r[5], allowedUsers: r[6], linkRole: r[9] || 'view', isInherited: false });
             }
         });
@@ -1149,7 +1368,7 @@ function buildStateArrayFromRaw(raw, ownerId) {
     for (const row of raw.folderRows) { 
         if (String(row[1]) === String(ownerId)) { 
             const sInfo = getEffectiveShare(row[0], null, false);
-            folderMap.set(row[0], { path: row[0], owner: row[1], shareInfo: sInfo }); 
+            folderMap.set(row[0], { path: row[0], owner: row[1], id: row[3] || '', shareInfo: sInfo }); 
         } 
     }
     
@@ -1162,7 +1381,7 @@ function buildStateArrayFromRaw(raw, ownerId) {
     
     for (const row of raw.trashRows) { 
         if (String(row[9]) === String(ownerId)) { 
-            trashMap.set(row[0], { id: row[0], name: row[1], originalName: row[2], format: row[3], folder: row[4], size: row[5], thumbId: row[6] }); 
+            trashMap.set(row[0], { id: row[0], name: row[1], originalName: row[2], format: row[3], folder: row[4], size: row[5], thumbId: row[6], expire: row[8] }); 
         } 
     }
     return { active: Array.from(activeMap.values()), trash: Array.from(trashMap.values()), folders: Array.from(folderMap.values()) };
@@ -1182,6 +1401,7 @@ function buildSharedWithMeFromRaw(raw, uid) {
     const results = [];
     for (const row of raw.sharesRows) {
         if (row[5] !== 'restricted' || row[2] !== 'folder') continue;
+        if (!shareRowMatchesFolder_(raw, row)) continue;
         let allowed = [];
         try { allowed = JSON.parse(row[6] || '[]'); } catch (e) { continue; }
         if (!allowed.some(u => u.uid === uid)) continue;
@@ -1293,7 +1513,50 @@ function isInsideTrashedFolder(path, trashedFolderPaths) {
     return false;
 }
 
+// ==========================================
+// HAPUS OTOMATIS SAMPAH SETELAH 30 HARI -- DIPICU BROWSER, BUKAN SERVER
+// ==========================================
+// Tanggal kedaluwarsa (tanggal masuk sampah + 30 hari, lengkap dengan jamnya) sudah
+// tersimpan di tiap baris sampah. Begitu user masuk ke akunnya, browser memeriksa
+// sampahnya: kalau ada item yang waktunya sudah tiba (kedaluwarsa <= sekarang), baru
+// browser meminta server menghapusnya permanen. Server tidak punya jadwal/pengecek
+// sendiri, jadi tidak membebani. User yang tidak pernah login = tidak ada yang dihapus.
+// Server tetap mengecek ulang tiap item dengan jam SERVER sebelum menghapus.
+let autoPurgeBusy = false;
+const autoPurgeCheckedOwners = new Set();
+function getExpiredTrashCount_() {
+    const now = Date.now();
+    return ((stateArray && stateArray.trash) || []).filter(t => { const ms = Date.parse(t.expire); return !isNaN(ms) && ms <= now; }).length;
+}
+async function autoPurgeExpiredTrash_(force) {
+    const owner = currentOwnerId;
+    if (!owner || autoPurgeBusy) return;
+    if (!force && autoPurgeCheckedOwners.has(owner)) return;
+    if (getExpiredTrashCount_() === 0) { autoPurgeCheckedOwners.add(owner); return; }
+    autoPurgeBusy = true;
+    try {
+        const res = await callGasAPI('purge_expired_trash', { ownerId: owner });
+        if (!res || !res.success) return; // gagal/jaringan -> dicoba lagi saat sinkron berikutnya
+        autoPurgeCheckedOwners.add(owner);
+        if (owner !== currentOwnerId) return;
+        if (res.purged > 0) {
+            markRecentWrite(owner);
+            const fresh = await callGasAPI('get_all_data', { ownerId: owner });
+            if (fresh && fresh.success && fresh.data && owner === currentOwnerId) {
+                stateArray = fresh.data;
+                if (!stateArray.active) stateArray.active = []; if (!stateArray.trash) stateArray.trash = []; if (!stateArray.folders) stateArray.folders = [];
+                lastDataSignature = JSON.stringify(stateArray);
+                renderUI();
+            }
+            showToast(`${res.purged} item di Sampah sudah lewat 30 hari dan dihapus permanen.`, false);
+        }
+    } finally { autoPurgeBusy = false; }
+}
+
 async function syncData() {
+    try { return await syncDataInner_(); } finally { autoPurgeExpiredTrash_(false); }
+}
+async function syncDataInner_() {
     try {
         // FIX: selama masa tenang pasca-tulis, langsung pakai jalur GAS (selalu
         // fresh) daripada gviz (bisa basi) supaya syncData() gak balik menimpa
@@ -1323,6 +1586,7 @@ async function syncData() {
 // UI RENDERERS
 // ==========================================
 function switchTab(tab) {
+    if (tab === 'trash') autoPurgeExpiredTrash_(true);
     currentTab = tab; currentPath = ''; clearSelection();
     document.getElementById('search-input').value = '';
     ['home', 'files', 'folders', 'trash', 'shared'].forEach(t => {
@@ -1487,8 +1751,8 @@ function renderUI() {
             let crumbHTML = `<span onclick="navigateToFolder('')">Beranda</span>`; let builtPath = '';
             segments.forEach((seg, idx) => {
                 builtPath = builtPath ? builtPath + '/' + seg : seg;
-                if (idx === segments.length - 1) crumbHTML += ` / <span>${seg}</span>`;
-                else crumbHTML += ` / <span onclick="navigateToFolder('${builtPath}')">${seg}</span>`;
+                if (idx === segments.length - 1) crumbHTML += ` / <span>${escapeHtml(seg)}</span>`;
+                else crumbHTML += ` / <span onclick="navigateToFolder('${jsStr(builtPath)}')">${escapeHtml(seg)}</span>`;
             });
             breadcrumbEl.innerHTML = crumbHTML;
             // Scroll ke ujung kanan supaya folder yang lagi dibuka (paling
@@ -1541,7 +1805,7 @@ function buildFolderCard_(fullFolderPath) {
 
     // FIX #5: nama folder juga input pengguna -> escape sebelum ditaruh di innerHTML.
     const card = document.createElement('div'); card.className = `folder-card ${selectedFolderPaths.has(fullFolderPath) ? 'selected' : ''} ${isSelectingMode ? 'selecting' : ''}`;
-    const safeAttrPath = fullFolderPath.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const safeAttrPath = jsStr(fullFolderPath);
     card.innerHTML = `
         <input type="checkbox" class="folder-checkbox" ${selectedFolderPaths.has(fullFolderPath) ? 'checked' : ''} onchange="toggleSelectFolder('${safeAttrPath}', this)">
         <div class="folder-icon-box"><span class="material-symbols-rounded">${folderIcon}</span></div>
@@ -1571,7 +1835,7 @@ function renderFolderTabOnly(filterText = '') {
         const card = document.createElement('div'); card.className = 'folder-card';
         card.onclick = (e) => { if (!e.target.closest('button')) navigateToFolder(fullFolderPath); };
         // FIX #5: escape teks + escape atribut onclick (dulu tidak di-escape sama sekali di sini).
-        const safeAttrPath = fullFolderPath.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+        const safeAttrPath = jsStr(fullFolderPath);
         card.innerHTML = `
             <div class="folder-icon-box"><span class="material-symbols-rounded">folder</span></div>
             <div class="folder-info"><span class="folder-name" title="${escapeHtml(fullFolderPath)}">${escapeHtml(fullFolderPath)}</span><span class="folder-meta">${metaText}</span></div>
@@ -1835,13 +2099,13 @@ function openMoveModal(mode) {
         // Disable folder yang menjadi lokasi item saat ini
         if (f === currentLocation) isDisabled = true;
 
-        let escapedPath = f.replace(/'/g, "\\'");
+        let escapedPath = jsStr(f);
         
         if (isDisabled) {
             // pointer-events: none memastikan elemen tidak akan memicu klik sama sekali
-            list.innerHTML += `<div class="move-list-item" style="opacity: 0.4; cursor: not-allowed; pointer-events: none; background: var(--surface-subtle);"><span class="material-symbols-rounded">folder</span> ${f} </div>`;
+            list.innerHTML += `<div class="move-list-item" style="opacity: 0.4; cursor: not-allowed; pointer-events: none; background: var(--surface-subtle);"><span class="material-symbols-rounded">folder</span> ${escapeHtml(f)} </div>`;
         } else {
-            list.innerHTML += `<div class="move-list-item" onclick="executeMove('${escapedPath}')"><span class="material-symbols-rounded">folder</span> ${f}</div>`;
+            list.innerHTML += `<div class="move-list-item" onclick="executeMove('${escapedPath}')"><span class="material-symbols-rounded">folder</span> ${escapeHtml(f)}</div>`;
         }
     });
     
@@ -2365,7 +2629,7 @@ async function parseAndShowExif(urlOrBlob, container) {
             if (output.Make || output.Model) {
                 const brand = output.Make || ''; const model = output.Model || '';
                 const fullName = model.toLowerCase().startsWith(brand.toLowerCase()) ? model : `${brand} ${model}`.trim();
-                html += `<div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;"><span class="material-symbols-rounded" style="font-size:20px; color:var(--primary);">photo_camera</span><span>Kamera: <b>${fullName}</b></span></div>`;
+                html += `<div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;"><span class="material-symbols-rounded" style="font-size:20px; color:var(--primary);">photo_camera</span><span>Kamera: <b>${escapeHtml(fullName)}</b></span></div>`;
             }
             if (output.ISO) html += `<div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;"><span class="material-symbols-rounded" style="font-size:20px; color:var(--primary);">iso</span><span>ISO: <b>${output.ISO}</b></span></div>`;
             if (output.ExposureTime) { const shutter = output.ExposureTime < 1 ? `1/${Math.round(1 / output.ExposureTime)}s` : `${output.ExposureTime}s`; html += `<div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;"><span class="material-symbols-rounded" style="font-size:20px; color:var(--primary);">shutter_speed</span><span>Shutter: <b>${shutter}</b></span></div>`; }
@@ -2385,17 +2649,38 @@ function openRenameModal() {
     document.getElementById('rename-modal').style.display = 'flex';
 }
 function closeRenameModal() { document.getElementById('rename-modal').style.display = 'none'; }
-function executeRenameFile() {
+async function executeRenameFile() {
     let newName = document.getElementById('rename-input').value.trim();
     // FIX #5/#7: validasi panjang & karakter berbahaya sebelum dikirim.
     if (newName.length > 300) { showToast("Nama file terlalu panjang (maksimal 300 karakter).", true); return; }
     if (/[<>]/.test(newName)) { showToast("Nama file tidak boleh mengandung karakter < atau >.", true); return; }
-    if (newName && newName !== selectedFileForAction.name) {
-        selectedFileForAction.name = newName;
-        callGasAPI('rename_file', { fileId: selectedFileForAction.id, newName: newName, ownerId: currentOwnerId });
-        renderUI();
-    }
+    const fileRef = selectedFileForAction;
+    if (!newName || !fileRef || newName === fileRef.name) { closeRenameModal(); return; }
+    const fileId = fileRef.id;
     closeRenameModal();
+
+    // Loading tetap tampil sampai data baru BENAR2 terbaca di server.
+    showLoadingOverlay("Mengganti nama file...", false, false);
+    const res = await callGasAPI('rename_file', { fileId: fileId, newName: newName, ownerId: currentOwnerId });
+    if (!res || (res.success === false && !res.networkError)) {
+        hideLoadingOverlay();
+        showToast((res && res.message) || "Gagal mengganti nama file.", true);
+        return;
+    }
+    updateLoadingOverlay(0, "Memverifikasi data...");
+    const v = await verifyOwnerData_(d => d.active.some(f => f.id === fileId && f.name === newName));
+    hideLoadingOverlay();
+    if (v.ok) {
+        stateArray = v.data;
+        markRecentWrite(currentOwnerId);
+        lastDataSignature = JSON.stringify(stateArray);
+        renderUI();
+        showToast("Nama file berhasil diganti!", false);
+    } else {
+        if (v.data) { stateArray = v.data; lastDataSignature = JSON.stringify(stateArray); }
+        renderUI();
+        showToast("Gagal mengganti nama file: perubahan tidak terbaca di server. Silakan coba lagi.", true);
+    }
 }
 
 async function downloadSelectedFile() {
@@ -3315,12 +3600,38 @@ async function startMultiUpload() {
 // (dulu sText/percentEl/fileNameText global); semua status/progress ditulis
 // ke kartu milik file ini sendiri lewat item & updateQueueItemProgress(qid,..).
 // Return true = sukses, false = gagal (file lain di antrian tetap lanjut).
+// Pembungkus: kalau upload GAGAL/DIBATALKAN setelah metadata sempat dikirim
+// (termasuk kasus 'gagal palsu' -- request sampai di server tapi balasannya
+// hilang), baris sisa di sheet dihapus (1 baris utuh, bukan dikosongkan,
+// supaya data di bawahnya naik sendiri) lewat action 'cleanup_upload'.
 async function processQueueItem(item, currentIdx, totalFiles) {
+    item.metaAttempted = false; item.uploadFileId = null; item.paused = false;
+    const isShared = sharedUploadActive, shareId = sharedUploadShareId, viewerUid = sharedUploadViewerUid, ownerId = currentOwnerId;
+    let ok = false;
+    try { ok = await processQueueItemInner_(item, currentIdx, totalFiles); }
+    catch (e) { ok = false; item.statusText = (e && e.message) || 'Gagal.'; }
+    if (!ok && item.metaAttempted && item.uploadFileId) cleanupOrphanUpload_(item.uploadFileId, isShared, shareId, viewerUid, ownerId);
+    return ok;
+}
+async function cleanupOrphanUpload_(fileId, isShared, shareId, viewerUid, ownerId) {
+    const payload = isShared ? { fileId, shareId, viewerUid } : { fileId, ownerId };
+    for (let i = 0; i < 4; i++) {
+        const res = await callGasAPI('cleanup_upload', payload);
+        if (res && (res.success || !res.networkError)) break;
+        await waitForConnection_(() => false, 60000);
+    }
+    if (isShared) sharedContentsCache.files = (sharedContentsCache.files || []).filter(f => f.id !== fileId);
+    else if (stateArray && stateArray.active) stateArray.active = stateArray.active.filter(f => f.id !== fileId);
+}
+
+async function processQueueItemInner_(item, currentIdx, totalFiles) {
+    const isSharedUp = sharedUploadActive, shareIdUp = sharedUploadShareId, viewerUidUp = sharedUploadViewerUid;
     const fileInput = item.file;
     const customName = item.customName.trim() || fileInput.name.split('.')[0];
     const format = item.ext.toLowerCase();
     const folderTarget = sharedUploadActive ? sharedCurrentPath : ((currentTab === 'home') ? currentPath : '');
     const uniqueId = 'FILE_' + Date.now() + '_' + item.qid;
+    item.uploadFileId = uniqueId;
     const prefix = totalFiles > 1 ? `[${currentIdx}/${totalFiles}] ` : '';
     let itemCancelled = false; // FIX: dulu 1 chunk gagal total (semua worker dicoba & tetap gagal)
                                 // langsung men-set isUploadCancelled GLOBAL, jadi ikut menghentikan
@@ -3452,6 +3763,9 @@ async function processQueueItem(item, currentIdx, totalFiles) {
 
         let chunkResult = null;
         let chunkErr = null;
+        let pauseRounds = 0;
+        while (true) {
+        chunkResult = null; chunkErr = null;
         for (let attempt = 0; attempt < CHUNK_MAX_ATTEMPTS; attempt++) {
             if (isUploadCancelled || itemCancelled || item.cancelRequested) break;
             // FormData harus dibuat baru tiap percobaan -- lihat catatan versi lama.
@@ -3497,6 +3811,23 @@ async function processQueueItem(item, currentIdx, totalFiles) {
             }
         }
 
+        if (!chunkErr) break;
+        if (isUploadCancelled || itemCancelled || item.cancelRequested) break;
+        if (!isNetworkishError_(chunkErr) || pauseRounds >= 40) break;
+        // KONEKSI PUTUS/LAG: jangan mengulang dari awal & jangan gagal. Bagian
+        // yang sudah terkirim (uploadedChunks) tetap aman di memori; upload
+        // JEDA di sini, lalu lanjut dari bagian yang sama begitu tersambung.
+        pauseRounds++;
+        item.paused = true;
+        item.loadedBytes = bytesSoFar;
+        item.progressPercent = Number(((bytesSoFar / fileInput.size) * 100).toFixed(1));
+        setStatusText(`${prefix}⏸ Terjeda ${item.progressPercent}% — koneksi terputus. Lanjut otomatis saat tersambung...`);
+        updateAggregateUploadUI();
+        const backOnline = await waitForConnection_(() => isUploadCancelled || itemCancelled || item.cancelRequested);
+        item.paused = false;
+        if (!backOnline) break;
+        setStatusText(`${prefix}Tersambung lagi, melanjutkan bagian ${i + 1}/${totalChunks}...`);
+        }
         if (chunkErr) {
             itemCancelled = true;
             // Kalau ini akibat pengguna sendiri menekan tombol Batalkan, status
@@ -3518,39 +3849,86 @@ async function processQueueItem(item, currentIdx, totalFiles) {
     if (itemCancelled) return false;
     if (item.cancelRequested) return false;
 
+    item.metaAttempted = true;
     setStatusText(`${prefix}Menyimpan metadata...`);
-    let metaRes;
-    if (sharedUploadActive) {
-        metaRes = await saveMetadataViaForm({ fileId: uniqueId, customName: customName, originalName: fileInput.name, format: format, folder: folderTarget, fileSize: fileInput.size, totalChunks: totalChunks, chunks: uploadedChunks, thumbId: thumbTelegramId, shareId: sharedUploadShareId, viewerUid: sharedUploadViewerUid }, 'shared_save_metadata');
-        if (metaRes && metaRes.success !== false && !sharedContentsCache.files.some(f => f.id === uniqueId)) sharedContentsCache.files.push({ id: uniqueId, name: customName, originalName: fileInput.name, format: format, folder: folderTarget, size: fileInput.size, thumbId: thumbTelegramId });
-    } else {
-        metaRes = await saveMetadataViaForm({ fileId: uniqueId, customName: customName, originalName: fileInput.name, format: format, folder: folderTarget, fileSize: fileInput.size, totalChunks: totalChunks, chunks: uploadedChunks, thumbId: thumbTelegramId, ownerId: currentOwnerId });
-        if (metaRes && metaRes.success !== false && !stateArray.active.some(f => f.id === uniqueId)) stateArray.active.push({ id: uniqueId, name: customName, originalName: fileInput.name, format: format, folder: folderTarget, size: fileInput.size, thumbId: thumbTelegramId });
-    }
+    const fileEntry = { id: uniqueId, name: customName, originalName: fileInput.name, format: format, folder: folderTarget, size: fileInput.size, thumbId: thumbTelegramId };
+    const pushToLocalCache = () => {
+        if (isSharedUp) { if (!sharedContentsCache.files.some(f => f.id === uniqueId)) sharedContentsCache.files.push(fileEntry); }
+        else { if (!stateArray.active.some(f => f.id === uniqueId)) stateArray.active.push(fileEntry); }
+    };
+    const metaAction = isSharedUp ? 'shared_save_metadata' : 'save_metadata';
+    const metaPayload = isSharedUp
+        ? { fileId: uniqueId, customName: customName, originalName: fileInput.name, format: format, folder: folderTarget, fileSize: fileInput.size, totalChunks: totalChunks, chunks: uploadedChunks, thumbId: thumbTelegramId, shareId: shareIdUp, viewerUid: viewerUidUp }
+        : { fileId: uniqueId, customName: customName, originalName: fileInput.name, format: format, folder: folderTarget, fileSize: fileInput.size, totalChunks: totalChunks, chunks: uploadedChunks, thumbId: thumbTelegramId, ownerId: currentOwnerId };
+    metaPayload.reqId = newReqId_(); // sama di semua percobaan ulang -> server tidak menulis 2x
 
-    if (!metaRes || metaRes.success === false) {
-        // FIX: sebelum benar-benar divonis gagal, cek dulu ke server apakah
-        // baris metadata ini SEBENARNYA sudah tersimpan (bisa terjadi kalau
-        // permintaan sempat sukses di server tapi RESPONSNYA yang gagal
-        // sampai balik ke browser -- pesan errornya jadi menyesatkan padahal
-        // datanya sudah ada). Kalau ternyata sudah ada, anggap sukses saja.
-        const verifyRes = sharedUploadActive
-            ? await callGasAPI('get_chunks', { fileId: uniqueId, shareId: sharedUploadShareId, viewerUid: sharedUploadViewerUid })
-            : await callGasAPI('get_chunks', { fileId: uniqueId, ownerId: currentOwnerId });
-        if (verifyRes && verifyRes.success) {
-            if (sharedUploadActive) { if (!sharedContentsCache.files.some(f => f.id === uniqueId)) sharedContentsCache.files.push({ id: uniqueId, name: customName, originalName: fileInput.name, format: format, folder: folderTarget, size: fileInput.size, thumbId: thumbTelegramId }); }
-            else { if (!stateArray.active.some(f => f.id === uniqueId)) stateArray.active.push({ id: uniqueId, name: customName, originalName: fileInput.name, format: format, folder: folderTarget, size: fileInput.size, thumbId: thumbTelegramId }); }
-            item.progressPercent = 100;
-            return true;
+    // Jalur 1: kirim metadata (jeda & ulang otomatis kalau koneksi putus).
+    const aborted = () => isUploadCancelled || item.cancelRequested;
+    const savePromise = (async () => {
+        let r;
+        while (true) {
+            r = await saveMetadataViaForm({ ...metaPayload }, metaAction);
+            if (r && r.networkError && !aborted()) {
+                item.paused = true;
+                setStatusText(`${prefix}⏸ Terjeda — koneksi terputus saat menyimpan data. Lanjut otomatis...`);
+                const back = await waitForConnection_(aborted, 10 * 60 * 1000);
+                item.paused = false;
+                if (!back) return r;
+                setStatusText(`${prefix}Menyimpan metadata...`);
+                continue;
+            }
+            return r;
         }
-        item.statusText = `Metadata gagal disimpan: ${(metaRes && metaRes.message) || 'semua server penuh/limit'}`;
-        setStatusText(item.statusText);
-        showToast(`Gagal menyimpan metadata untuk ${customName}: ${(metaRes && metaRes.message) || 'semua server penuh/limit'}.`, true);
-        return false;
+    })().then(r => ({ kind: 'save', r })).catch(e => ({ kind: 'save', r: { success: false, message: (e && e.message) || 'Gagal.' } }));
+
+    // Jalur 2 (pengintai): begitu barisnya BENAR2 sudah muncul di sheet, berarti
+    // data sudah lengkap & file sudah tampil -> langsung sukses, tanpa menunggu
+    // balasan server dan tanpa verifikasi tambahan.
+    let watching = true;
+    const watchPromise = (async () => {
+        await sleep(900);
+        while (watching && !aborted()) {
+            try {
+                const raw = await fetchRawSheets();
+                if ((raw.sheet1Rows || []).some(r => String(r[0] || '').trim() === uniqueId)) return { kind: 'seen' };
+            } catch (e) { /* abaikan, coba lagi */ }
+            await sleep(1200);
+        }
+        return { kind: 'stopped' };
+    })();
+
+    let first = await Promise.race([savePromise, watchPromise]);
+    if (first.kind === 'stopped') first = await savePromise;
+    watching = false;
+
+    if (first.kind === 'seen') {
+        pushToLocalCache();
+        item.progressPercent = 100;
+        return true; // sukses langsung -- sisa request di latar belakang diabaikan
     }
 
-    item.progressPercent = 100;
-    return true;
+    const metaRes = first.r;
+    if (metaRes && metaRes.success !== false) {
+        pushToLocalCache();
+        item.progressPercent = 100;
+        return true;
+    }
+    if (metaRes && metaRes.cancelled) return false;
+
+    // Respons gagal: cek SEKALI apakah barisnya ternyata sudah tersimpan
+    // (balasan hilang tapi datanya masuk) sebelum dinyatakan gagal.
+    const verifyRes = isSharedUp
+        ? await callGasAPI('get_chunks', { fileId: uniqueId, shareId: shareIdUp, viewerUid: viewerUidUp })
+        : await callGasAPI('get_chunks', { fileId: uniqueId, ownerId: currentOwnerId });
+    if (verifyRes && verifyRes.success) {
+        pushToLocalCache();
+        item.progressPercent = 100;
+        return true;
+    }
+    item.statusText = `Metadata gagal disimpan: ${(metaRes && metaRes.message) || 'semua server penuh/limit'}`;
+    setStatusText(item.statusText);
+    showToast(`Gagal menyimpan metadata untuk ${customName}: ${(metaRes && metaRes.message) || 'semua server penuh/limit'}.`, true);
+    return false;
 }
 
 function openCreateFolderModal() { document.getElementById('folder-modal').style.display = 'flex'; }
@@ -3908,6 +4286,13 @@ function showSharedFullscreenLoader(text) {
 }
 
 async function handleSharedLink(code) {
+    if (!isValidShareCode_(code)) {
+        document.getElementById('login-view').style.display = 'none';
+        document.getElementById('app-layout').style.display = 'none';
+        document.getElementById('shared-view').style.display = 'flex';
+        renderShare404();
+        return;
+    }
     pendingShareCode = code;
     sharedSelectedIds.clear(); sharedIsSelecting = false;
     document.getElementById('login-view').style.display = 'none';
@@ -3954,6 +4339,7 @@ async function handleSharedLink(code) {
                 await redirectOwnerToDeletedError(ownerAccount, res); return;
             }
         }
+        if (res.inTrash) { sharedTrashShown = true; renderShare404(); updateSharedViewChrome(); startSharedPolling(code); return; }
         stopSharedPolling(); renderShare404(); updateSharedViewChrome(); return;
     }
 
@@ -4015,7 +4401,7 @@ async function handleSharedLink(code) {
     updateSharedViewChrome();
 
     document.getElementById('shared-owner-banner').style.display = 'flex';
-    document.getElementById('shared-owner-banner').innerHTML = `<span class="material-symbols-rounded" style="font-size:18px;">person</span> Dibagikan oleh <b>&nbsp;${res.ownerName}</b>`;
+    document.getElementById('shared-owner-banner').innerHTML = `<span class="material-symbols-rounded" style="font-size:18px;">person</span> Dibagikan oleh <b>&nbsp;${escapeHtml(res.ownerName)}</b>`;
 
     // FIXED: Menggunakan sharedViewerUid bukan viewerUid
     if (res.itemType === 'file') renderSharedFileBody(res, code, sharedViewerUid);
@@ -4238,7 +4624,8 @@ function hideSharedUploadFab() {
 // level terakhir yang masih benar2 ada di data. Ini otomatis menangani
 // folder perantara yang baru saja di-rename/dipindah pemiliknya, tanpa
 // perlu percobaan/fallback terpisah -- cukup 1 kali jalan, semua di memori.
-function resolveSharedViewFromRaw(raw, shareCode, viewerUid, pathSegments) {
+function resolveSharedViewFromRaw(raw, shareCode, viewerUid, pathSegments, prevSnapshots) {
+    if (prevSnapshots === undefined) prevSnapshots = sharedLevelSnapshots;
     if (!raw || !raw.sharesRows) return { ok: false, notFound: true };
     const shareRow = raw.sharesRows.find(r => String(r[0] || '').trim() === String(shareCode || '').trim());
     if (!shareRow) return { ok: false, notFound: true };
@@ -4254,12 +4641,20 @@ function resolveSharedViewFromRaw(raw, shareCode, viewerUid, pathSegments) {
 
     let activeItemRow = null;
     if (itemType === 'file') activeItemRow = raw.sheet1Rows.find(r => String(r[0] || '').trim() === itemId && String(r[8] || '').trim() === ownerId);
-    else if (itemType === 'folder') activeItemRow = raw.folderRows.find(r => String(r[0] || '').trim() === itemId && String(r[1] || '').trim() === ownerId);
+    else if (itemType === 'folder') {
+        activeItemRow = raw.folderRows.find(r => String(r[0] || '').trim() === itemId && String(r[1] || '').trim() === ownerId);
+        // Folder aktif di path ini bukan folder yang dulu dibagikan (ID beda) -> share ini bukan miliknya.
+        if (activeItemRow && !shareRowMatchesFolder_(raw, shareRow)) activeItemRow = null;
+    }
 
     if (!activeItemRow) {
         let trashItemRow = null;
         if (itemType === 'file') trashItemRow = raw.trashRows.find(r => String(r[0] || '').trim() === itemId && String(r[9] || '').trim() === ownerId);
-        else if (itemType === 'folder') trashItemRow = raw.trashRows.find(r => String(r[0] || '').trim() === itemId && String(r[3] || '').trim() === 'sys_folder' && String(r[9] || '').trim() === ownerId);
+        else if (itemType === 'folder') {
+            const shareFid = String(shareRow[10] || '').trim();
+            trashItemRow = raw.trashRows.find(r => String(r[3] || '').trim() === 'sys_folder' && String(r[9] || '').trim() === ownerId &&
+                (shareFid ? String(r[6] || '').trim() === shareFid : String(r[0] || '').trim() === itemId));
+        }
         return {
             ok: false, deleted: true, ownerId, ownerName, itemType, inTrash: !!trashItemRow,
             item: trashItemRow ? { id: trashItemRow[0], name: trashItemRow[1], format: trashItemRow[3], folder: trashItemRow[4] } : null
@@ -4297,36 +4692,68 @@ function resolveSharedViewFromRaw(raw, shareCode, viewerUid, pathSegments) {
     const allFoldersLower = Array.from(allFolders).map(f => f.toLowerCase());
 
     const rootPath = itemId;
+    const accessIdx = sharedBuildAccessIndex_(raw, ownerId);
+    const newSnaps = [];
     let resolvedPath = rootPath;
     let resolvedSegments = [];
+    let accessLost = false, followedRename = false;
     for (let i = 0; i < (pathSegments || []).length; i++) {
-        const candidate = resolvedPath + '/' + pathSegments[i];
-        if (!allFoldersLower.includes(candidate.toLowerCase())) break;
+        let seg = pathSegments[i];
+        const curSnap = sharedSnapshotChildren_(raw, ownerId, allFolders, resolvedPath);
+        newSnaps[i] = curSnap;
+        let candidate = resolvedPath + '/' + seg;
+        if (!allFoldersLower.includes(candidate.toLowerCase())) {
+            // Folder di level ini hilang dari nama lamanya -- cek apakah itu
+            // RENAME oleh pemilik (bandingkan dengan foto level ini sebelumnya).
+            // Kalau iya, ikuti nama barunya: posisi viewer TIDAK berubah.
+            const renamed = sharedDetectRename_(prevSnapshots && prevSnapshots[i], curSnap, seg);
+            if (!renamed) break;
+            seg = renamed; candidate = resolvedPath + '/' + seg; followedRename = true;
+        }
+        const acc = sharedEffectiveFolderAccess_(accessIdx, rootPath, role, candidate, viewerUid);
+        if (!acc.ok) { accessLost = true; break; }
         resolvedPath = candidate;
-        resolvedSegments.push(pathSegments[i]);
+        resolvedSegments.push(seg);
     }
+    newSnaps[resolvedSegments.length] = sharedSnapshotChildren_(raw, ownerId, allFolders, resolvedPath);
+    newSnaps.length = resolvedSegments.length + 1;
+
+    // Peran EFEKTIF di folder tempat viewer berada sekarang (bisa lebih ketat dari root).
+    const here = sharedEffectiveFolderAccess_(accessIdx, rootPath, role, resolvedPath, viewerUid);
+    const hereRole = here.ok ? here.role : 'view';
 
     const contents = { subfolders: [], files: [] };
+    const subfolderRoles = {}, fileRoles = {};
     allFolders.forEach(f => {
         if (f.toLowerCase().startsWith(resolvedPath.toLowerCase() + '/') && f.toLowerCase() !== resolvedPath.toLowerCase()) {
             const rel = f.substring(resolvedPath.length + 1);
             const nextSeg = rel.split('/')[0];
             if (nextSeg) {
                 const fullSub = resolvedPath + '/' + nextSeg;
-                if (!contents.subfolders.some(s => s.toLowerCase() === fullSub.toLowerCase())) contents.subfolders.push(fullSub);
+                if (!contents.subfolders.some(sf => sf.toLowerCase() === fullSub.toLowerCase())) {
+                    // Privasi single yang tidak cocok dengan izin folder utama -> item hilang dari tampilan viewer.
+                    const a = sharedEffectiveFolderAccess_(accessIdx, rootPath, role, fullSub, viewerUid);
+                    if (!a.ok) return;
+                    contents.subfolders.push(fullSub);
+                    subfolderRoles[fullSub] = a.role;
+                }
             }
         }
     });
     raw.sheet1Rows.forEach(r => {
         let fileFolder = String(r[4] || '').trim(); if (fileFolder === '#*null*#') fileFolder = '';
         if (String(r[8] || '').trim() === ownerId && fileFolder.toLowerCase() === resolvedPath.toLowerCase()) {
+            const a = sharedEffectiveFileAccess_(accessIdx, rootPath, role, String(r[0]), resolvedPath, viewerUid);
+            if (!a.ok) return;
             contents.files.push({ id: String(r[0]), name: String(r[1]), originalName: String(r[2]), format: String(r[3]), folder: r[4], size: r[5], thumbId: r[6] });
+            fileRoles[String(r[0])] = a.role;
         }
     });
 
     const subfolderShares = {}, fileShares = {};
     (raw.sharesRows || []).forEach(r => {
         if (String(r[3] || '').trim() !== ownerId) return;
+        if (!shareRowMatchesFolder_(raw, r)) return;
         const sInfo = { shareId: r[0], privacy: String(r[5] || 'private').trim() };
         const sType = String(r[2] || '').trim().toLowerCase();
         if (sType === 'folder') subfolderShares[String(r[1] || '').trim()] = sInfo;
@@ -4334,13 +4761,16 @@ function resolveSharedViewFromRaw(raw, shareCode, viewerUid, pathSegments) {
     });
 
     return {
-        ok: true, authorized: true, itemType: 'folder', ownerId, ownerName, role,
+        ok: true, authorized: true, itemType: 'folder', ownerId, ownerName, role: hereRole,
         path: resolvedPath, pathSegments: resolvedSegments, truncated: resolvedSegments.length !== (pathSegments || []).length,
-        item: { path: resolvedPath, name: resolvedPath.split('/').pop() || 'Beranda', contents, subfolderShares, fileShares }
+        accessLost: accessLost, followedRename: followedRename, snapshots: newSnaps,
+        item: { path: resolvedPath, name: resolvedPath.split('/').pop() || 'Beranda', contents, subfolderShares, fileShares, subfolderRoles, fileRoles }
     };
 }
 
 let sharedUI = { signature: null };
+let sharedTrashShown = false;      // halaman sedang menampilkan 404 karena item ada di Sampah (bisa pulih)
+let sharedNotFoundStreak = 0;      // berapa tick berturut-turut baris share tidak ditemukan
 
 function startSharedPolling(code) {
     stopSharedPolling();
@@ -4350,10 +4780,10 @@ function startSharedPolling(code) {
     sharedPollTimer = setInterval(async () => {
         if (pendingShareCode !== code || document.getElementById('shared-view').style.display === 'none') { stopSharedPolling(); return; }
 
-        // Selama upload ke folder share ini masih berjalan, tick realtime
-        // dilewati dulu (bukan dimatikan -- cuma ditunda) supaya tidak
-        // mengganggu progres upload yang sedang jalan.
-        if (isUploadInProgress && sharedUploadActive) return;
+        const uploadingHere = isUploadInProgress && sharedUploadActive;
+        // Masa tenang pasca-tulis milik viewer ini sendiri (rename): gviz bisa
+        // basi dan menimpa balik hasil yang sudah terverifikasi -> tunda tick.
+        if (!uploadingHere && isInGvizCooldown(code)) return;
 
         // Simpan epoch navigasi SEKARANG, sebelum fetch di bawah berjalan --
         // dicek lagi sebelum hasilnya diterapkan, supaya kalau user sudah
@@ -4367,7 +4797,29 @@ function startSharedPolling(code) {
         const r = resolveSharedViewFromRaw(raw, code, sharedViewerUid, sharedPathSegments);
         if (tickEpoch !== sharedNavEpoch) return; // ada navigasi lain yang lebih baru -- buang hasil ini
 
-        if (!r.ok && r.notFound) return; // jangan langsung 404 dari 1 kali baca gviz basi -- tunggu tick berikutnya
+        if (!r.ok && r.notFound) {
+            // Jangan langsung 404 dari 1 kali baca gviz basi. Tapi kalau berturut-turut
+            // tidak ketemu DAN GAS (live) juga bilang tidak ada -> dihapus permanen: 404 final.
+            sharedNotFoundStreak++;
+            if (sharedNotFoundStreak >= 4) {
+                const live = await callGasAPIFetch('resolve_share', { shareId: code, viewerUid: sharedViewerUid, subPath: null });
+                if (live && live.notFound) {
+                    stopSharedPolling(); closePreviewModal(); hideSharedUploadFab();
+                    hideLoadingOverlay(); renderShare404();
+                } else sharedNotFoundStreak = 0;
+            }
+            return;
+        }
+        sharedNotFoundStreak = 0;
+        if (!r.ok && r.deleted && r.inTrash) {
+            // Ada di SAMPAH pemilik: tampilkan 404, tapi TETAP memantau. Link tidak
+            // berubah; begitu dipulihkan halaman ini langsung terbuka lagi.
+            closePreviewModal(); hideSharedUploadFab(); hideLoadingOverlay();
+            if (uploadingHere) { closeUploadModal(); isUploadInProgress = false; showToast("Upload dibatalkan: folder ini dipindahkan ke sampah oleh pemiliknya.", true); }
+            if (!sharedTrashShown) { sharedTrashShown = true; renderShare404(); }
+            return;
+        }
+        if (sharedTrashShown && r.ok) { sharedTrashShown = false; location.reload(); return; }
         if (!r.ok && r.deleted) {
             stopSharedPolling(); closePreviewModal(); hideSharedUploadFab();
             sharedDownloadCancelled = true;
@@ -4390,12 +4842,28 @@ function startSharedPolling(code) {
         }
         if (!r.ok) return; // bentuk kegagalan lain yang tak terduga -- aman diabaikan, dicoba lagi tick berikutnya
 
-        if (sharedUploadActive && isUploadInProgress && r.role !== 'edit') {
-            closeUploadModal();
-            showToast("Upload dibatalkan: akses Edit Anda di folder ini baru saja dicabut pemiliknya.", true);
+        if (r.itemType === 'folder') sharedLevelSnapshots = r.snapshots || [];
+
+        // Upload ke folder share dibatalkan SEKETIKA kalau izinnya berubah
+        // (privasi/peran/akses folder tujuan) atau folder tujuannya berpindah/
+        // hilang -- percuma diteruskan, pasti ditolak server.
+        if (uploadingHere) {
+            const samePath = r.itemType === 'folder' && String(r.path || '').toLowerCase() === String(sharedCurrentPath || '').toLowerCase();
+            if (r.role !== 'edit' || !samePath) {
+                closeUploadModal();
+                isUploadInProgress = false;
+                showToast(r.role !== 'edit'
+                    ? "Upload dibatalkan: izin Edit Anda di folder ini baru saja dicabut/diubah pemiliknya."
+                    : "Upload dibatalkan: folder tujuan baru saja diubah/dipindah/dibatasi pemiliknya.", true);
+            } else {
+                return; // upload masih sah -- jangan render ulang halaman saat upload berjalan
+            }
         }
-        if (r.itemType === 'folder' && r.truncated) {
-            showToast("Salah satu folder di jalur ini sudah diganti nama/dipindah pemiliknya — ditampilkan dari folder terdekat yang masih ada.", true);
+        if (r.itemType === 'folder' && r.truncated && !r.accessLost && !r.followedRename) {
+            showToast("Folder ini sudah tidak ada lagi (dihapus/dipindah pemiliknya) — ditampilkan dari folder terdekat yang masih ada.", true);
+        }
+        if (r.itemType === 'folder' && r.accessLost) {
+            showToast("Anda tidak lagi punya akses ke folder tempat Anda berada — ditampilkan dari folder terdekat yang masih bisa dibuka.", true);
         }
 
         pendingShareResolved = Object.assign({}, pendingShareResolved, { success: true, authorized: true, itemType: r.itemType, ownerId: r.ownerId, ownerName: r.ownerName, role: r.role, item: r.item });
@@ -4436,7 +4904,7 @@ function updateSharedFileMetaDisplay(item) {
     if (titleEl) { titleEl.innerText = displayName; titleEl.title = displayName; }
     if (sizeEl) sizeEl.innerText = formatBytes(item.size);
     const downloadBtn = body.querySelector('button.btn-primary');
-    if (downloadBtn) downloadBtn.setAttribute('onclick', `downloadSharedFile('${item.id}','${item.format || ''}','${displayName.replace(/'/g, "\\'")}','${pendingShareCode}','${sharedViewerUid}')`);
+    if (downloadBtn) downloadBtn.setAttribute('onclick', `downloadSharedFile('${jsStr(item.id)}','${jsStr(item.format || '')}','${jsStr(displayName)}','${jsStr(pendingShareCode)}','${jsStr(sharedViewerUid)}')`);
 }
 
 // Sinkronkan judul modal preview file yang lagi terbuka SAAT browsing folder
@@ -4484,7 +4952,7 @@ function renderSharedAuthWall(res) {
         <div class="shared-auth-wall">
             <span class="material-symbols-rounded">lock_person</span>
             <h2 style="font-size:20px; font-weight:800; color:var(--text-primary);">Akses Terbatas</h2>
-            <p style="color:var(--text-muted); font-size:13.5px; max-width:340px;">${res.ownerName} hanya memberikan akses ke akun tertentu untuk item ini. Login dengan akun yang diberi akses untuk membukanya.</p>
+            <p style="color:var(--text-muted); font-size:13.5px; max-width:340px;">${escapeHtml(res.ownerName)} hanya memberikan akses ke akun tertentu untuk item ini. Login dengan akun yang diberi akses untuk membukanya.</p>
         </div>`;
     document.getElementById('share-login-text').innerText = 'Login untuk membuka item ini';
     document.getElementById('share-login-prompt').style.display = 'flex';
@@ -4504,7 +4972,7 @@ function renderSharedBreadcrumb(res, subPath) {
     const el = document.getElementById('shared-breadcrumb');
     if (res.itemType === 'file' && !res.item.folder) {
         el.style.display = 'flex';
-        el.innerHTML = `<span>${res.ownerName || 'Beranda'}</span><span>&gt;</span><span>membagikan file</span>`;
+        el.innerHTML = `<span>${escapeHtml(res.ownerName || 'Beranda')}</span><span>&gt;</span><span>membagikan file</span>`;
         return;
     }
     el.style.display = 'flex';
@@ -4520,12 +4988,12 @@ function renderSharedBreadcrumb(res, subPath) {
     const rootPartsCount = Math.max(curParts.length - sharedPathSegments.length, 0);
     curParts.forEach((seg, idx) => {
         const isLast = idx === curParts.length - 1;
-        if (isLast) { html += ` <span>/</span> <span>${seg}</span>`; return; }
+        if (isLast) { html += ` <span>/</span> <span>${escapeHtml(seg)}</span>`; return; }
         if (idx >= rootPartsCount - 1) {
             const relDepth = idx - rootPartsCount; // -1 = balik ke root
-            html += ` <span>/</span> <span class="crumb-link" onclick="jumpSharedBreadcrumb(${relDepth})">${seg}</span>`;
+            html += ` <span>/</span> <span class="crumb-link" onclick="jumpSharedBreadcrumb(${relDepth})">${escapeHtml(seg)}</span>`;
         } else {
-            html += ` <span>/</span> <span style="cursor:default;">${seg}</span>`;
+            html += ` <span>/</span> <span style="cursor:default;">${escapeHtml(seg)}</span>`;
         }
     });
     el.innerHTML = html;
@@ -4594,6 +5062,7 @@ async function navigateSharedTo() {
     if (!r.ok || r.itemType !== 'folder') { renderShare404(); return; }
 
     sharedPathSegments = r.pathSegments;
+    sharedLevelSnapshots = r.snapshots || [];
     pendingShareResolved = Object.assign({}, pendingShareResolved, { success: true, authorized: true, itemType: 'folder', ownerId: r.ownerId, ownerName: r.ownerName, role: r.role, item: r.item });
     renderSharedFolderBody({ ownerId: r.ownerId, ownerName: r.ownerName, itemType: 'folder', item: r.item, role: r.role }, pendingShareCode, sharedViewerUid, r.path);
     resetSharedViewScroll();
@@ -4618,17 +5087,17 @@ async function renderSharedFileBody(res, shareId, viewerUid) {
     let displayName = item.name + (item.format ? '.' + item.format : '');
     renderSharedBreadcrumb(res, '');
     const body = document.getElementById('shared-body');
-    const safeDisplayName = displayName.replace(/'/g, "\\'");
+    const safeDisplayName = jsStr(displayName);
     const renameBtnHTML = sharedFileShareRole === 'edit'
-        ? `<button class="icon-btn" style="margin-top:16px;" onclick="sharedRenameStandaloneFile('${item.id}','${escapeHtml(item.name).replace(/'/g, "\\'")}','${shareId}','${viewerUid}')" title="Ganti Nama"><span class="material-symbols-rounded">edit</span></button>`
+        ? `<button class="icon-btn" style="margin-top:16px;" onclick="sharedRenameStandaloneFile('${jsStr(item.id)}','${jsStr(item.name)}','${jsStr(shareId)}','${jsStr(viewerUid)}')" title="Ganti Nama"><span class="material-symbols-rounded">edit</span></button>`
         : '';
     body.innerHTML = `
         <div style="max-width:700px; margin:0 auto; background:#fff; border-radius:var(--radius-lg); padding:24px; box-shadow:var(--shadow-card);">
-            <h2 style="font-size:18px; font-weight:800; margin-bottom:4px; word-break:break-all;">${displayName}</h2>
+            <h2 style="font-size:18px; font-weight:800; margin-bottom:4px; word-break:break-all;">${escapeHtml(displayName)}</h2>
             <p style="font-size:12.5px; color:var(--text-muted); margin-bottom:18px;">${formatBytes(item.size)}</p>
             <div id="shared-preview-container" style="min-height:280px; background:#0f172a; border-radius:var(--radius-md); display:flex; align-items:center; justify-content:center; overflow:auto;"></div>
             <div style="display:flex; align-items:center; gap:10px;">
-                <button class="btn-primary" style="margin-top:16px;" onclick="downloadSharedFile('${item.id}','${item.format || ''}','${safeDisplayName}','${shareId}','${viewerUid}')"><span class="material-symbols-rounded">download</span> Unduh Berkas</button>
+                <button class="btn-primary" style="margin-top:16px;" onclick="downloadSharedFile('${jsStr(item.id)}','${jsStr(item.format || '')}','${safeDisplayName}','${jsStr(shareId)}','${jsStr(viewerUid)}')"><span class="material-symbols-rounded">download</span> Unduh Berkas</button>
                 ${renameBtnHTML}
             </div>
         </div>`;
@@ -4656,12 +5125,20 @@ async function sharedRenameStandaloneFile(fileId, currentName, shareId, viewerUi
     if (newName === null) return;
     const trimmed = newName.trim();
     if (!trimmed) return showToast("Nama tidak boleh kosong.", true);
+    if (trimmed === currentName) return;
     if (trimmed.length > 300) return showToast("Nama terlalu panjang (maksimal 300 karakter).", true);
     if (/[<>]/.test(trimmed)) return showToast("Nama tidak boleh mengandung karakter < atau >.", true);
     showLoadingOverlay("Menyimpan nama baru...", false, false);
     const res = await callGasAPI('shared_rename_file', { fileId: fileId, newName: trimmed, shareId: shareId, viewerUid: viewerUid });
+    if (!res || (!res.success && !res.networkError)) {
+        hideLoadingOverlay();
+        return showToast((res && res.message) || "Gagal mengubah nama.", true);
+    }
+    updateLoadingOverlay(0, "Memverifikasi data...");
+    const v = await verifySharedData_(shareId, viewerUid, null, r => r.item && r.item.name === trimmed);
     hideLoadingOverlay();
-    if (res && res.success) {
+    if (v.ok) {
+        markRecentWrite(shareId);
         showToast("Nama berhasil diubah.", false);
         const titleEl = document.querySelector('#shared-body h2');
         if (titleEl) {
@@ -4671,7 +5148,7 @@ async function sharedRenameStandaloneFile(fileId, currentName, shareId, viewerUi
         }
         if (pendingShareResolved && pendingShareResolved.item) pendingShareResolved.item.name = trimmed;
     } else {
-        showToast((res && res.message) || "Gagal mengubah nama.", true);
+        showToast("Gagal mengubah nama: perubahan tidak terbaca di server. Silakan coba lagi.", true);
     }
 }
 
@@ -4817,7 +5294,7 @@ async function collectSharedFolderFilesRecursive(folderPath, relPrefix, rawData 
     const ownerId = pendingShareResolved.ownerId;
     
     const checkOverrideAccess = (targetId, tType, oId, vUid) => {
-         const overrideRow = raw.sharesRows.find(r => r[1] === targetId && r[2] === tType);
+         const overrideRow = raw.sharesRows.find(r => r[1] === targetId && r[2] === tType && shareRowMatchesFolder_(raw, r));
          if (!overrideRow) return true;
          const oPriv = overrideRow[5];
          let oAllow = []; try { oAllow = JSON.parse(overrideRow[6] || '[]'); } catch(e){}
@@ -4869,6 +5346,8 @@ async function renderSharedFolderBody(res, shareId, viewerUid, subPath) {
     // sendiri) -- dipakai untuk fitur "Salin Link" per item di menu.
     sharedContentsCache.subfolderShares = res.item.subfolderShares || {};
     sharedContentsCache.fileShares = res.item.fileShares || {};
+    sharedContentsCache.subfolderRoles = res.item.subfolderRoles || {};
+    sharedContentsCache.fileRoles = res.item.fileRoles || {};
     sharedSelectedIds.clear(); sharedSelectedFolderPaths.clear(); sharedIsSelecting = false;
     updateSharedUploadFab(res.role, shareId, viewerUid);
     renderSharedBreadcrumb(Object.assign({ ownerId: pendingShareResolved ? pendingShareResolved.ownerId : res.ownerId, ownerName: pendingShareResolved ? pendingShareResolved.ownerName : res.ownerName }, res), subPath);
@@ -4876,7 +5355,7 @@ async function renderSharedFolderBody(res, shareId, viewerUid, subPath) {
     const body = document.getElementById('shared-body');
     body.innerHTML = `
         <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; gap:12px; flex-wrap:wrap;">
-            <h2 style="font-size:20px; font-weight:800;">${res.item.name}</h2>
+            <h2 style="font-size:20px; font-weight:800;">${escapeHtml(res.item.name)}</h2>
             <label id="shared-select-all-container" style="display:none; align-items:center; gap:6px; font-size:12.5px; font-weight:600; cursor:pointer; color:var(--primary);">
                 <input type="checkbox" id="shared-select-all-cb" onchange="toggleSelectAllShared(this)" style="width:16px; height:16px; accent-color:var(--primary);">Pilih Semua
             </label>
@@ -4897,7 +5376,7 @@ async function renderSharedFolderBody(res, shareId, viewerUid, subPath) {
     const subfolders = sharedContentsCache.subfolders || [];
     if (subfolders.length === 0) folderGrid.style.display = 'none'; else folderGrid.style.display = 'grid';
     subfolders.forEach(sf => {
-        const safePath = sf.replace(/'/g, "\\'");
+        const safePath = jsStr(sf);
         const isSelected = sharedSelectedFolderPaths.has(sf);
         const card = document.createElement('div'); card.className = `folder-card ${isSelected ? 'selected' : ''} ${sharedIsSelecting ? 'selecting' : ''}`;
         card.innerHTML = `
@@ -4928,7 +5407,7 @@ async function renderSharedFolderBody(res, shareId, viewerUid, subPath) {
             <input type="checkbox" class="file-checkbox" ${isSelected ? 'checked' : ''} onchange="toggleSharedSelect(event,'${f.id}', this)">
             <button class="icon-btn file-menu-btn" onclick="openSharedFileMenu(event, '${f.id}')"><span class="material-symbols-rounded" style="font-size:20px;">more_vert</span></button>
             <div class="file-thumbnail" id="shared-thumb-${f.id}"><span class="material-symbols-rounded" style="font-size:42px;">${getFileIcon(f.format)}</span></div>
-            <div class="file-info-area"><span class="file-title-text" title="${displayFilename}">${displayFilename}</span><span class="file-sub">${formatBytes(f.size)}</span></div>
+            <div class="file-info-area"><span class="file-title-text" title="${escapeHtml(displayFilename)}">${escapeHtml(displayFilename)}</span><span class="file-sub">${formatBytes(f.size)}</span></div>
         `;
         attachLongPressHandlers(card, () => {
             suppressNextClick = true; sharedIsSelecting = true;
@@ -5015,7 +5494,8 @@ function openSharedFileMenu(e, fileId) {
     // boleh ganti nama & hapus (ke sampah pemilik), sama seperti pemilik.
     // Kalau perannya cuma Lihat, menu tetap terbatas ke info & download.
     let editItemsHTML = '';
-    if (sharedUploadFabRole === 'edit') {
+    const fileItemRole = (sharedContentsCache.fileRoles || {})[fileId];
+    if (sharedUploadFabRole === 'edit' && fileItemRole !== 'view') {
         editItemsHTML = `
         <hr style="border: 0; border-top: 1px solid var(--border-color); margin: 6px 0;">
         <div class="action-menu-item" onclick="sharedRenameFileFromMenu()"><span class="material-symbols-rounded">edit</span> Ganti Nama</div>
@@ -5054,14 +5534,24 @@ async function sharedRenameFileFromMenu() {
     if (!trimmed) return showToast("Nama tidak boleh kosong.", true);
     if (trimmed.length > 300) return showToast("Nama terlalu panjang (maksimal 300 karakter).", true);
     if (/[<>]/.test(trimmed)) return showToast("Nama tidak boleh mengandung karakter < atau >.", true);
+    if (trimmed === item.name) return;
+    const folderAtStart = sharedCurrentPath;
     showLoadingOverlay("Menyimpan nama baru...", false, false);
     const res = await callGasAPI('shared_rename_file', { fileId: item.id, newName: trimmed, shareId: pendingShareCode, viewerUid: sharedViewerUid });
+    if (!res || (!res.success && !res.networkError)) {
+        hideLoadingOverlay();
+        return showToast((res && res.message) || "Gagal mengubah nama.", true);
+    }
+    updateLoadingOverlay(0, "Memverifikasi data...");
+    const v = await verifySharedData_(pendingShareCode, sharedViewerUid, folderAtStart || null,
+        r => r.item && r.item.contents && (r.item.contents.files || []).some(f => String(f.id) === String(item.id) && f.name === trimmed));
     hideLoadingOverlay();
-    if (res && res.success) {
+    if (v.ok) {
+        markRecentWrite(pendingShareCode);
         item.name = trimmed;
         showToast("Nama berhasil diubah.", false);
         renderSharedFolderBody(pendingShareResolved, pendingShareCode, sharedViewerUid, sharedCurrentPath);
-    } else { showToast((res && res.message) || "Gagal mengubah nama.", true); }
+    } else { showToast("Gagal mengubah nama: perubahan tidak terbaca di server. Silakan coba lagi.", true); }
 }
 // FIX: hapus (pindahkan ke sampah pemilik) file di dalam folder share
 // dengan akses Edit.
@@ -5135,7 +5625,8 @@ function openSharedFolderMenu(e, folderPath) {
     // nama & dihapus (dipindahkan ke sampah pemilik beserta isinya), sama
     // seperti file.
     let editItemsHTML = '';
-    if (sharedUploadFabRole === 'edit') {
+    const folderItemRole = (sharedContentsCache.subfolderRoles || {})[folderPath];
+    if (sharedUploadFabRole === 'edit' && folderItemRole !== 'view') {
         editItemsHTML = `
         <hr style="border: 0; border-top: 1px solid var(--border-color); margin: 6px 0;">
         <div class="action-menu-item" onclick="sharedRenameFolderFromMenu()"><span class="material-symbols-rounded">edit</span> Ganti Nama</div>
@@ -5184,13 +5675,29 @@ async function sharedRenameFolderFromMenu() {
     if (trimmed.length > 300) return showToast("Nama terlalu panjang (maksimal 300 karakter).", true);
     if (/[<>\/]/.test(trimmed)) return showToast("Nama tidak boleh mengandung karakter < > /.", true);
     if (trimmed === oldName) return;
+    const parentPath = path.substring(0, path.lastIndexOf('/'));
+    const newPath = parentPath ? parentPath + '/' + trimmed : trimmed;
     showLoadingOverlay("Menyimpan nama baru...", false, false);
     const res = await callGasAPI('shared_rename_folder', { folderPath: path, newName: trimmed, shareId: pendingShareCode, viewerUid: sharedViewerUid });
+    if (!res || (!res.success && !res.networkError)) {
+        hideLoadingOverlay();
+        return showToast((res && res.message) || "Gagal mengubah nama folder.", true);
+    }
+    updateLoadingOverlay(0, "Memverifikasi data...");
+    const lc = x => String(x || '').toLowerCase();
+    const v = await verifySharedData_(pendingShareCode, sharedViewerUid, parentPath || null, r => {
+        const subs = (r.item && r.item.contents && r.item.contents.subfolders) || [];
+        return subs.some(f => lc(f) === lc(newPath)) && !subs.some(f => lc(f) === lc(path));
+    });
     hideLoadingOverlay();
-    if (res && res.success) {
+    if (v.ok) {
+        markRecentWrite(pendingShareCode);
         showToast("Nama folder berhasil diubah.", false);
-        navigateSharedTo();
-    } else { showToast((res && res.message) || "Gagal mengubah nama folder.", true); }
+        // Render dari hasil live (bukan gviz yang bisa basi). Posisi viewer
+        // (di folder induk) tidak berubah.
+        const rr = v.res;
+        renderSharedFolderBody({ ownerId: rr.ownerId, ownerName: rr.ownerName, itemType: 'folder', item: rr.item, role: rr.role }, pendingShareCode, sharedViewerUid, (rr.item && rr.item.path) || sharedCurrentPath);
+    } else { showToast("Gagal mengubah nama folder: perubahan tidak terbaca di server. Silakan coba lagi.", true); }
 }
 // FIX: hapus (pindahkan ke sampah pemilik) subfolder beserta isinya, di
 // dalam folder share dengan akses Edit.
@@ -5610,7 +6117,7 @@ async function renderPreviewContent(url, ext, container, blob) {
                 if (code === 4 && isSafari) {
                     msg = 'Video gagal diputar di Safari. Ini sering terjadi karena server streaming belum mendukung "Range request" (dibutuhkan Safari, tapi tidak selalu oleh browser lain) -- bukan berarti codec videonya pasti tidak didukung.';
                 }
-                container.innerHTML = `<div style="color:#fff;text-align:center;max-width:420px;"><span class="material-symbols-rounded" style="font-size:48px;">movie_off</span><p style="margin-top:10px;font-size:13px;">${msg}</p><button class="btn-primary" style="margin-top:14px;padding:8px 18px;" onclick="downloadSelectedFile()">Download Berkas</button></div>`;
+                container.innerHTML = `<div style="color:#fff;text-align:center;max-width:420px;"><span class="material-symbols-rounded" style="font-size:48px;">movie_off</span><p style="margin-top:10px;font-size:13px;">${escapeHtml(msg)}</p><button class="btn-primary" style="margin-top:14px;padding:8px 18px;" onclick="downloadSelectedFile()">Download Berkas</button></div>`;
             });
             initCustomVideoPlayer(v);
             return;
@@ -6134,7 +6641,9 @@ function closeRenameFolderModal() { document.getElementById('rename-folder-modal
 async function executeRenameFolder() {
     let newName = document.getElementById('rename-folder-input').value.trim();
     if (!newName) return showToast("Nama tidak boleh kosong.", true);
-    
+    if (newName.length > 300) return showToast("Nama folder terlalu panjang (maksimal 300 karakter).", true);
+    if (/[<>\/]/.test(newName)) return showToast("Nama folder tidak boleh mengandung karakter < > /.", true);
+
     const oldPath = selectedFolderForAction;
     const oldName = oldPath.split('/').pop();
     if (newName === oldName) return closeRenameFolderModal();
@@ -6144,23 +6653,37 @@ async function executeRenameFolder() {
 
     closeRenameFolderModal();
     showLoadingOverlay("Mengganti nama folder...", false, false);
+    // Hanya MENGGANTI NAMA di baris folder itu (oldPath -> newPath); backend
+    // yang mengkaskade ke isi/sub-folder. Tidak ada salin/buat folder baru.
     const res = await callGasAPI('rename_folder_dir', { oldPath: oldPath, newPath: newPath, ownerId: currentOwnerId });
+    if (!res || (res.success === false && !res.networkError)) {
+        hideLoadingOverlay();
+        showToast((res && res.message) || "Gagal mengganti nama folder.", true);
+        return;
+    }
+    updateLoadingOverlay(0, "Memverifikasi data...");
+    const under = (p, base) => p === base || (p && p.startsWith(base + '/'));
+    const v = await verifyOwnerData_(d => {
+        const newExists = d.folders.some(f => under(f.path, newPath)) || d.active.some(f => under(f.folder, newPath));
+        // Folder lama harus BENAR2 hilang -- kalau masih ada berarti yang
+        // terjadi salin (duplikat), bukan ganti nama -> dianggap gagal.
+        const oldGone = !d.folders.some(f => under(f.path, oldPath)) && !d.active.some(f => under(f.folder, oldPath));
+        return newExists && oldGone;
+    });
     hideLoadingOverlay();
-    
-    if (res && res.success !== false) {
-        if (stateArray.folders) stateArray.folders.forEach(f => {
-            if (f.path === oldPath) f.path = newPath;
-            else if (f.path.startsWith(oldPath + '/')) f.path = f.path.replace(oldPath, newPath);
-        });
-        if (stateArray.active) stateArray.active.forEach(f => {
-            if (f.folder === oldPath) f.folder = newPath;
-            else if (f.folder && f.folder.startsWith(oldPath + '/')) f.folder = f.folder.replace(oldPath, newPath);
-        });
-        markRecentWrite(currentOwnerId); // FIX: cegah polling gviz basi menimpa balik hasil rename
-        lastDataSignature = JSON.stringify(stateArray); // biar polling gak anggap ini "beda" pas cooldown selesai
+    if (v.ok) {
+        stateArray = v.data;
+        // Kalau user lagi berada di dalam folder yang di-rename, ikut pindah ke path barunya.
+        if (currentPath === oldPath || currentPath.startsWith(oldPath + '/')) currentPath = newPath + currentPath.substring(oldPath.length);
+        markRecentWrite(currentOwnerId); // cegah polling gviz basi menimpa balik hasil rename
+        lastDataSignature = JSON.stringify(stateArray);
         renderUI();
         showToast("Nama folder berhasil diganti!", false);
-    } else { showToast((res && res.message) || "Gagal mengganti nama folder.", true); }
+    } else {
+        if (v.data) { stateArray = v.data; lastDataSignature = JSON.stringify(stateArray); }
+        renderUI();
+        showToast("Gagal mengganti nama folder: perubahan tidak terverifikasi di server (atau folder lama masih ada). Silakan coba lagi.", true);
+    }
 }
 
 async function downloadFolderAsZipOwner() {
@@ -6263,6 +6786,7 @@ async function getSharedDataFromSheets(shareCode, viewerUid, subPath = null, for
                 activeItemRow = raw.sheet1Rows.find(r => String(r[0] || '').trim() === itemId && String(r[8] || '').trim() === ownerId);
             } else if (itemType === 'folder') {
                 activeItemRow = raw.folderRows.find(r => String(r[0] || '').trim() === itemId && String(r[1] || '').trim() === ownerId);
+                if (activeItemRow && !shareRowMatchesFolder_(raw, shareRow)) activeItemRow = null; // ID beda = folder lain
             }
 
             if (!activeItemRow) {
@@ -6283,7 +6807,9 @@ async function getSharedDataFromSheets(shareCode, viewerUid, subPath = null, for
                 if (itemType === 'file') {
                     trashItemRow = raw.trashRows.find(r => String(r[0] || '').trim() === itemId && String(r[9] || '').trim() === ownerId);
                 } else if (itemType === 'folder') {
-                    trashItemRow = raw.trashRows.find(r => String(r[0] || '').trim() === itemId && String(r[3] || '').trim() === 'sys_folder' && String(r[9] || '').trim() === ownerId);
+                    const shareFid = String(shareRow[10] || '').trim();
+                    trashItemRow = raw.trashRows.find(r => String(r[3] || '').trim() === 'sys_folder' && String(r[9] || '').trim() === ownerId &&
+                        (shareFid ? String(r[6] || '').trim() === shareFid : String(r[0] || '').trim() === itemId));
                 }
                 return {
                     success: false, deleted: true, ownerId, ownerName, itemType,
@@ -6316,7 +6842,12 @@ async function getSharedDataFromSheets(shareCode, viewerUid, subPath = null, for
 
             // Jika item adalah Folder
             const rootPath = itemId;
-            const currentBrowsePath = (subPath !== null && subPath !== undefined && String(subPath).trim() !== '') ? String(subPath).trim() : rootPath;
+            const accessIdx0 = sharedBuildAccessIndex_(raw, ownerId);
+            let currentBrowsePath = (subPath !== null && subPath !== undefined && String(subPath).trim() !== '') ? String(subPath).trim() : rootPath;
+            if (!sharedEffectiveFolderAccess_(accessIdx0, rootPath, role, currentBrowsePath, viewerUid).ok) currentBrowsePath = rootPath;
+            const rootRole0 = role;
+            const effHere0 = sharedEffectiveFolderAccess_(accessIdx0, rootPath, rootRole0, currentBrowsePath, viewerUid);
+            role = effHere0.ok ? effHere0.role : role;
 
             const contents = { subfolders: [], files: [] };
             const allFolders = new Set();
@@ -6376,6 +6907,19 @@ async function getSharedDataFromSheets(shareCode, viewerUid, subPath = null, for
             // server. Sama seperti pengecekan root di atas: kalau isinya
             // kelihatan kosong, konfirmasi SEKALI ke GAS (live, tanpa cache)
             // dulu sebelum ditampilkan sebagai folder kosong ke viewer.
+            // Sembunyikan item yang privasi single-nya tidak cocok dengan izin folder utama.
+            const subfolderRoles0 = {}, fileRoles0 = {};
+            contents.subfolders = contents.subfolders.filter(f => {
+                const a = sharedEffectiveFolderAccess_(accessIdx0, rootPath, rootRole0, f, viewerUid);
+                if (a.ok) subfolderRoles0[f] = a.role;
+                return a.ok;
+            });
+            contents.files = contents.files.filter(f => {
+                const a = sharedEffectiveFileAccess_(accessIdx0, rootPath, rootRole0, f.id, currentBrowsePath, viewerUid);
+                if (a.ok) fileRoles0[f.id] = a.role;
+                return a.ok;
+            });
+
             if (contents.subfolders.length === 0 && contents.files.length === 0) {
                 const liveConfirmEmpty = await callGasAPIFetch('resolve_share', { shareId: shareCode, viewerUid: viewerUid, subPath: subPath });
                 if (liveConfirmEmpty && liveConfirmEmpty.success) return liveConfirmEmpty;
@@ -6389,6 +6933,7 @@ async function getSharedDataFromSheets(shareCode, viewerUid, subPath = null, for
             const subfolderShares = {}, fileShares = {};
             (raw.sharesRows || []).forEach(r => {
                 if (String(r[3] || '').trim() !== ownerId) return;
+                if (!shareRowMatchesFolder_(raw, r)) return;
                 const sInfo = { shareId: r[0], privacy: String(r[5] || 'private').trim() };
                 const sType = String(r[2] || '').trim().toLowerCase();
                 if (sType === 'folder') subfolderShares[String(r[1] || '').trim()] = sInfo;
@@ -6408,7 +6953,9 @@ async function getSharedDataFromSheets(shareCode, viewerUid, subPath = null, for
                     name: currentBrowsePath.split('/').pop() || 'Beranda',
                     contents: contents,
                     subfolderShares: subfolderShares,
-                    fileShares: fileShares
+                    fileShares: fileShares,
+                    subfolderRoles: subfolderRoles0,
+                    fileRoles: fileRoles0
                 }
             };
         }
@@ -6534,17 +7081,34 @@ if ('serviceWorker' in navigator) {
     //    hanya dipakai untuk menampilkan peringatan, bukan menutup app.
     const warningEl = document.getElementById('devtools-warning');
     let devtoolsWasOpen = false;
+    let strikes = 0;
+    // HP/tablet: JANGAN dicek sama sekali. Di iPhone/Android, keyboard layar,
+    // address bar yang mengecil/membesar, dan rotasi layar mengubah innerHeight
+    // sehingga selisih outer-inner gampang >160px -- itu bukan DevTools.
+    const isTouchDevice = (navigator.maxTouchPoints || 0) > 0 || /iPhone|iPad|iPod|Android|Mobile/i.test(navigator.userAgent || '') ||
+        (window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+    function isTyping() {
+        const a = document.activeElement;
+        return !!a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.tagName === 'SELECT' || a.isContentEditable);
+    }
     function checkDevtools() {
-        if (!warningEl) return;
-        const threshold = 160;
+        if (!warningEl || isTouchDevice) return;
+        // Lagi mengetik / layar dizoom -> ukuran jendela tidak bisa dipercaya.
+        const vv = window.visualViewport;
+        if (isTyping() || (vv && Math.abs(vv.scale - 1) > 0.01) || document.hidden) { strikes = 0; return; }
+        const threshold = 200;
         const widthDiff = window.outerWidth - window.innerWidth;
         const heightDiff = window.outerHeight - window.innerHeight;
-        const isOpen = widthDiff > threshold || heightDiff > threshold;
+        const looksOpen = widthDiff > threshold || heightDiff > threshold;
+        // Harus terdeteksi 3x berturut-turut (3 detik) baru dianggap terbuka.
+        strikes = looksOpen ? Math.min(strikes + 1, 3) : 0;
+        const isOpen = looksOpen ? strikes >= 3 : false;
         if (isOpen !== devtoolsWasOpen) {
             devtoolsWasOpen = isOpen;
             warningEl.classList.toggle('show', isOpen);
         }
     }
+    if (warningEl) warningEl.classList.remove('show');
     setInterval(checkDevtools, 1000);
 })();
 
